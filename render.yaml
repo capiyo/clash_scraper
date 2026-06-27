@@ -1,10 +1,40 @@
+# render.yaml
 services:
+  # Cron Job for fixture scraping (runs every 6 hours)
   - type: cron
-    name: worldcup-fixture-scraper
-    runtime: python
-    schedule: "0 */6 * * *"   # every 6 hours — adjust as needed
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "python scraper.py"
+    name: worldcup-scraper
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python scraper.py
+    schedule: "0 */6 * * *"  # Every 6 hours
     envVars:
       - key: MONGO_URI
-        sync: false   # set the real value in the Render dashboard, not here
+        sync: false  # You'll set this in Render dashboard
+      - key: MONGO_DB
+        value: clashdb
+      - key: MONGO_COLLECTION
+        value: fixtures
+      - key: FANCLASH_API
+        value: https://clash-api-m5mr.onrender.com/api
+      - key: PYTHON_VERSION
+        value: 3.11.0  # Use stable Python version
+
+  # Background Worker for live polling (runs continuously)
+  - type: worker
+    name: worldcup-poller
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python poller.py
+    envVars:
+      - key: MONGO_URI
+        sync: false
+      - key: MONGO_DB
+        value: clashdb
+      - key: MONGO_COLLECTION
+        value: fixtures
+      - key: FANCLASH_API
+        value: https://clash-api-m5mr.onrender.com/api
+      - key: POLL_INTERVAL_SECONDS
+        value: 30
+      - key: PYTHON_VERSION
+        value: 3.11.0

@@ -1,103 +1,89 @@
 """
-365Scores API client.
-
-Fixture discovery endpoint CONFIRMED by direct browser DevTools network
-capture on 2026-06-27, loading the actual World Cup fixtures page:
-
-    GET https://webws.365scores.com/web/games/fixtures/
-        ?appTypeId=5&langId=1&timezoneName=<tz>&userCountryId=<id>
-        &competitions=<comma-separated competition ids>
-        &showOdds=true&includeTopBettingOpportunity=1&topBookmaker=14
-
-This is a DIFFERENT route from games/current/. games/current/ silently
-ignores the `competitions` param and always returns a generic top-100
-"what's happening right now" list — confirmed by requesting
-competitions=5930 against games/current/ and getting back Botola 2,
-Yemeni League, OBOS-ligaen, etc. with zero World Cup games.
-
-games/fixtures/ is the endpoint the real 365scores.com web UI calls
-when you load a competition's schedule/fixtures tab, and it correctly
-filters by competitions=. Do not revert to games/current/ for
-competition-scoped fixture discovery.
+365Scores API client for World Cup data.
+Uses the confirmed-working /web/games/fixtures/ endpoint.
 """
 from __future__ import annotations
 
 import logging
-from typing import Optional
-
 import requests
-
-import config
+from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger("worldcup_poller.sources.threesixtyfive")
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json",
-    "Referer": "https://www.365scores.com/",
-}
+# Base URL for 365Scores API
+BASE_URL = "https://webws.365scores.com"
 
-FIXTURES_PATH = "/games/fixtures/"
+# Default headers (mimicking browser request)
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.365scores.com/",
+    "Origin": "https://www.365scores.com",
+}
 
 
 def fetch_games_by_competition(
-    competition_ids: list[int],
-    timezone_name: str = "UTC",
-    user_country_id: Optional[int] = None,
-) -> Optional[list[dict]]:
-    """Fetch fixtures for the given competition IDs via the confirmed
-    /web/games/fixtures/ endpoint.
-
-    Args:
-        competition_ids: 365Scores competition IDs to filter by, e.g. [5930].
-        timezone_name: IANA tz name passed straight through to 365Scores
-            (affects kickoff time display in the response, not which
-            games are returned).
-        user_country_id: optional 365Scores country ID; only affects
-            odds/bookmaker fields in the response, safe to omit.
-
-    Returns:
-        List of raw game dicts as returned by 365Scores, or None on any
-        request/parsing failure (treat as "try again later", not as
-        confirmed zero fixtures).
+    competition_ids: List[int],
+    timezone_name: str = "Africa/Nairobi",
+    user_country_id: int = 413,
+    show_odds: bool = True,
+) -> Optional[List[Dict[str, Any]]]:
+    """
+    Fetch games for given competition IDs using the /web/games/fixtures/ endpoint.
+    
+    This endpoint was confirmed via browser DevTools capture on the actual
+    365Scores World Cup page. The games/current/ endpoint silently ignores
+    the competitions parameter, while games/fixtures/ respects it.
     """
     params = {
-        "appTypeId": config.THREESIXTYFIVE_APP_TYPE_ID,
-        "langId": config.THREESIXTYFIVE_LANG_ID,
+        "appTypeId": 5,
+        "langId": 1,
         "timezoneName": timezone_name,
-        "competitions": ",".join(str(c) for c in competition_ids),
+        "userCountryId": user_country_id,
+        "competitions": ",".join(str(cid) for cid in competition_ids),
+        "showOdds": str(show_odds).lower(),
+        "includeTopBettingOpportunity": "1",
+        "topBookmaker": "14",
     }
-    if user_country_id is not None:
-        params["userCountryId"] = user_country_id
 
-    url = f"{config.THREESIXTYFIVE_BASE}{FIXTURES_PATH}"
-
+    url = f"{BASE_URL}/web/games/fixtures/"
+    
     try:
-        resp = requests.get(
-            url,
-            params=params,
-            headers=HEADERS,
-            timeout=config.REQUEST_TIMEOUT_SECONDS,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except (requests.RequestException, ValueError) as exc:
-        logger.error("fetch_games_by_competition failed: %s", exc)
+        logger.debug(f"Fetching from {url} with params {params}")
+        response = requests.get(url, headers=DEFAULT_HEADERS, params=params, timeout=30)
+        response.raise_for_status()
+        
+        data = response.json()
+        games = data.get("games", [])
+        logger.info(f"fetch_games_by_competition({competition_ids}): {len(games)} games returned")
+        
+        return games
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to fetch games from 365Scores: {e}")
+        return None
+    except ValueError as e:
+        logger.error(f"Failed to parse JSON response: {e}")
         return None
 
-    games = data.get("games", [])
-    if not isinstance(games, list):
-        logger.error(
-            "Unexpected response shape: 'games' is %s, not a list",
-            type(games),
-        )
-        return None
 
-    logger.info(
-        "fetch_games_by_competition(%s): %d games returned",
-        competition_ids, len(games),
-    )
-    return games
+def fetch_game_details(game_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Fetch detailed information for a specific game.
+    """
+    url = f"{BASE_URL}/web/games/details/"
+    params = {
+        "appTypeId": 5,
+        "langId": 1,
+        "gameId": game_id,
+        "showOdds": "true",
+    }
+    
+    try:
+        response = requests.get(url, headers=DEFAULT_HEADERS, params=params, timeout=30)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to fetch game details for {game_id}: {e}")
+        return None
