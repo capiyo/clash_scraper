@@ -54,13 +54,14 @@ class FixtureStore:
         time_str = kickoff_utc.strftime("%H:%M")
         date_iso = kickoff_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
         
-        home_win = None
-        away_win = None
-        draw = None
+        # ✅ FIXED: Default to 1.0 instead of None
+        home_win = 1.0
+        away_win = 1.0
+        draw = 1.0
         if odds:
-            home_win = odds.get("homeWin")
-            away_win = odds.get("awayWin")
-            draw = odds.get("draw")
+            home_win = odds.get("homeWin", 1.0)
+            away_win = odds.get("awayWin", 1.0)
+            draw = odds.get("draw", 1.0)
 
         is_live = status == "live"
         available_for_voting = status in ("upcoming", "soon")
@@ -81,9 +82,9 @@ class FixtureStore:
             "status": status,
             "is_live": is_live,
             "available_for_voting": available_for_voting,
-            "home_win": home_win,
-            "away_win": away_win,
-            "draw": draw,
+            "home_win": home_win,      # ✅ Now always a number
+            "away_win": away_win,      # ✅ Now always a number
+            "draw": draw,              # ✅ Now always a number
             "scraped_at": datetime.now(timezone.utc),
             "source": "365scores",
             "last_scraped_at": datetime.now(timezone.utc),

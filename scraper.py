@@ -74,15 +74,15 @@ def scrape_world_cup_fixtures(store: FixtureStore) -> int:
         match_id = f"wc26_{game_id}"
 
         store.upsert_fixture(
-    match_id=match_id,
-    threesixtyfive_game_id=game_id,
-    home_team=home_team,
-    away_team=away_team,
-    kickoff_utc=kickoff,
-    status=status,
-    competition_name=comp_name,  # Now optional
-    odds=game.get("odds", {})
-)
+            match_id=match_id,
+            threesixtyfive_game_id=game_id,
+            home_team=home_team,
+            away_team=away_team,
+            kickoff_utc=kickoff,
+            status=status,
+            competition_name=comp_name,
+            odds=game.get("odds", {})
+        )
         upserted += 1
         logger.info(f"Upserted {match_id}: {home_team} vs {away_team} [{status}]")
 
