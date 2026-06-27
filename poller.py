@@ -1,6 +1,7 @@
 """
 Live poller for World Cup matches with full state machine.
 Handles: upcoming → soon → live → completed → archived
+Fetches lineups when matches are in "soon" state (40-60 mins before kickoff)
 """
 from __future__ import annotations
 
@@ -32,7 +33,8 @@ POLL_INTERVAL_UPCOMING = 300  # Every 5 minutes for upcoming matches
 
 # Time thresholds (in minutes before kickoff)
 SOON_THRESHOLD_MINUTES = 60   # 1 hour before kickoff = "soon"
-LINEUP_THRESHOLD_MINUTES = 45 # 45 minutes before kickoff = fetch lineups
+LINEUP_EARLY_THRESHOLD = 60   # Start checking at 60 mins before
+LINEUP_LATE_THRESHOLD = 40    # Stop checking at 40 mins before
 STATS_THRESHOLD_MINUTES = 10  # 10 minutes before kickoff = start stats
 
 
@@ -83,7 +85,6 @@ class MatchStateMachine:
         
         # Check if match has started (we might have missed the status change)
         if minutes_until_kickoff <= 0:
-            # Match should be live now
             return "live"
         
         # Check if match is "soon" (within 1 hour)
@@ -102,34 +103,45 @@ class MatchStateMachine:
         else:
             return POLL_INTERVAL_UPCOMING
 
-    def should_fetch_lineups(self, match: Dict[str, Any], state: str) -> bool:
+    def should_fetch_lineups(self, match: Dict[str, Any], state: str, minutes_to_kickoff: Optional[float] = None) -> bool:
         """
         Determine if we should fetch lineups for this match.
+        
+        CRITICAL: This is the main function that decides when to fetch lineups.
+        
         Lineups are fetched when:
-        1. Match is in "soon" state (within 1 hour of kickoff)
-        2. We haven't fetched them yet
-        3. Match is not completed
+        1. NOT already fetched (lineups_fetched == False)
+        2. Match is in "soon" state AND within 40-60 minutes of kickoff
+        3. OR match is "live" and lineups not fetched (we missed the window)
         """
         match_id = match.get("match_id")
         
         # Don't fetch if already fetched or match is completed
         if match_id in self.lineups_fetched:
+            logger.debug(f"{match_id}: Lineups already fetched, skipping")
             return False
         
         if state == "completed":
+            logger.debug(f"{match_id}: Match completed, skipping lineups")
             return False
         
-        # Fetch lineups when match is "soon" (within 1 hour)
-        if state == "soon":
+        # If match is "live" and lineups not fetched, fetch immediately
+        if state == "live":
+            logger.info(f"📋 {match_id}: Live but no lineups - fetching now")
             return True
         
-        # Also fetch if match is "live" and we somehow missed the soon window
-        if state == "live" and match_id not in self.lineups_fetched:
-            return True
+        # If match is "soon", check time window
+        if state == "soon" and minutes_to_kickoff is not None:
+            should_fetch = LINEUP_LATE_THRESHOLD <= minutes_to_kickoff <= LINEUP_EARLY_THRESHOLD
+            if should_fetch:
+                logger.info(f"📋 {match_id}: {minutes_to_kickoff:.0f} mins to kickoff - fetching lineups")
+            else:
+                logger.debug(f"{match_id}: {minutes_to_kickoff:.0f} mins to kickoff - outside lineup window ({LINEUP_LATE_THRESHOLD}-{LINEUP_EARLY_THRESHOLD} mins)")
+            return should_fetch
         
         return False
 
-    def should_fetch_statistics(self, match: Dict[str, Any], state: str) -> bool:
+    def should_fetch_statistics(self, match: Dict[str, Any], state: str, minutes_to_kickoff: Optional[float] = None) -> bool:
         """
         Determine if we should fetch statistics for this match.
         Statistics are fetched when:
@@ -148,18 +160,8 @@ class MatchStateMachine:
             return True
         
         # If match is "soon", only fetch stats if within 10 minutes
-        if status == "soon":
-            kickoff = match.get("kickoff_utc")
-            if isinstance(kickoff, str):
-                try:
-                    kickoff = datetime.fromisoformat(kickoff.replace("Z", "+00:00"))
-                except:
-                    return False
-            
-            if kickoff:
-                now = datetime.now(timezone.utc)
-                minutes_until = (kickoff - now).total_seconds() / 60
-                return minutes_until <= STATS_THRESHOLD_MINUTES
+        if status == "soon" and minutes_to_kickoff is not None:
+            return minutes_to_kickoff <= STATS_THRESHOLD_MINUTES
         
         return False
 
@@ -170,6 +172,7 @@ class MatchStateMachine:
         """
         current_status = match.get("status", "upcoming")
         kickoff_utc = match.get("kickoff_utc")
+        minutes_to_kickoff = match.get("minutes_to_kickoff")
         
         if not kickoff_utc:
             return None
@@ -181,31 +184,19 @@ class MatchStateMachine:
                 return None
         
         now = datetime.now(timezone.utc)
-        minutes_until_kickoff = (kickoff_utc - now).total_seconds() / 60
+        if minutes_to_kickoff is None:
+            minutes_to_kickoff = (kickoff_utc - now).total_seconds() / 60
         
         # Don't change completed matches
         if current_status == "completed":
             return None
         
-        # Match should be live if kickoff time has passed or match is already live
-        if minutes_until_kickoff <= 0 or current_status == "live":
-            # Check if match should be completed (based on 365Scores status)
-            game_id = match.get("threesixtyfive_game_id")
-            if game_id:
-                details = threesixtyfive.fetch_game_details(game_id)
-                if details:
-                    status_text = details.get("statusText", "").lower()
-                    if status_text in ("finished", "ft", "ended", "full-time"):
-                        return "completed"
-                    elif status_text in ("live", "in progress"):
-                        return "live"
-            
-            # If we don't have details, assume live if kickoff passed
-            if minutes_until_kickoff <= 0:
-                return "live"
+        # Match should be live if kickoff time has passed
+        if minutes_to_kickoff <= 0 and current_status != "live":
+            return "live"
         
         # Match is "soon" if within 1 hour of kickoff
-        if minutes_until_kickoff <= SOON_THRESHOLD_MINUTES and current_status == "upcoming":
+        if minutes_to_kickoff <= SOON_THRESHOLD_MINUTES and current_status == "upcoming":
             return "soon"
         
         return None
@@ -231,6 +222,7 @@ class MatchStateMachine:
     def mark_lineups_done(self, match_id: str):
         """Mark that lineups have been fetched for a match."""
         self.lineups_fetched.add(match_id)
+        logger.debug(f"{match_id}: Marked lineups as fetched")
 
     def mark_stats_started(self, match_id: str):
         """Mark that statistics have started for a match."""
@@ -272,6 +264,8 @@ class Poller:
             logger.debug("No fixtures found")
             return
 
+        logger.info(f"📊 Poll cycle #{self.poll_count}: Processing {len(all_fixtures)} fixtures")
+        
         # Process each match based on its state
         for match in all_fixtures:
             self._process_match(match)
@@ -284,6 +278,21 @@ class Poller:
         if not game_id:
             logger.warning(f"No 365Scores game_id for {match_id}, skipping")
             return
+
+        # Calculate minutes until kickoff
+        kickoff_utc = match.get("kickoff_utc")
+        minutes_to_kickoff = None
+        if kickoff_utc:
+            if isinstance(kickoff_utc, str):
+                try:
+                    kickoff_utc = datetime.fromisoformat(kickoff_utc.replace("Z", "+00:00"))
+                except:
+                    pass
+            
+            if isinstance(kickoff_utc, datetime):
+                now = datetime.now(timezone.utc)
+                minutes_to_kickoff = (kickoff_utc - now).total_seconds() / 60
+                match["minutes_to_kickoff"] = minutes_to_kickoff
 
         # Determine current state
         state = self.state_machine.determine_state(match)
@@ -302,6 +311,7 @@ class Poller:
                 "status": new_status,
                 "is_live": new_status == "live",
                 "available_for_voting": new_status in ["upcoming", "soon"],
+                "minutes_to_kickoff": minutes_to_kickoff,
             })
             
             # If status changed to completed, finalize result
@@ -318,12 +328,12 @@ class Poller:
             current_status = new_status
 
         # --- STEP 2: FETCH LINEUPS (if in soon state) ---
-        if self.state_machine.should_fetch_lineups(match, current_status):
+        if self.state_machine.should_fetch_lineups(match, current_status, minutes_to_kickoff):
             self._fetch_and_forward_lineups(match)
             self.state_machine.mark_lineups_done(match_id)
 
         # --- STEP 3: FETCH STATISTICS (if live or soon near kickoff) ---
-        if self.state_machine.should_fetch_statistics(match, current_status):
+        if self.state_machine.should_fetch_statistics(match, current_status, minutes_to_kickoff):
             self._fetch_and_forward_statistics(match)
 
         # --- STEP 4: FETCH LIVE UPDATES (if live) ---
@@ -343,7 +353,7 @@ class Poller:
         
         lineups = threesixtyfive.fetch_lineups(game_id)
         if lineups:
-            # Store in MongoDB
+            # Store in MongoDB (this sets lineups_fetched=True)
             self.store.store_lineups(match_id, lineups)
             
             # Forward to Rust API
@@ -392,6 +402,7 @@ class Poller:
         away_score = details.get("awayScore")
         if home_score is not None:
             self.store.update_score(match_id, home_score, away_score)
+            logger.info(f"📊 {match_id}: Score updated {home_score}-{away_score}")
         
         # Update status (check if match ended)
         status_text = details.get("statusText", "").lower()
@@ -428,7 +439,11 @@ class Poller:
         new_events = []
         
         for event in events:
-            signature = f"{event.get('type')}:{event.get('minute')}:{event.get('team')}"
+            event_type = event.get("type", "unknown")
+            minute = event.get("minute", 0)
+            team = event.get("team", "")
+            signature = f"{event_type}:{minute}:{team}"
+            
             if signature not in forwarded:
                 new_events.append(event)
                 self.store.add_forwarded_event_signature(match_id, signature)
@@ -455,7 +470,7 @@ class Poller:
                 }
                 self.forwarder.forward_event(event_payload)
                 
-                logger.info(f"⚽ {match_id}: {event.get('type')} at {event.get('minute')}'")
+                logger.info(f"⚽ {match_id}: {event.get('type')} at {event.get('minute')}' by {event.get('player', 'Unknown')}")
 
     def _process_commentary(self, match: Dict[str, Any], commentary: List[Dict]):
         """Process and forward match commentary."""
@@ -469,17 +484,20 @@ class Poller:
                     "text": entry.get("text", ""),
                     "type": entry.get("type", "general"),
                     "team": entry.get("team"),
+                    "player": entry.get("player"),
                 }
             }
             self.forwarder.forward_commentary(payload)
+            logger.debug(f"💬 {match_id}: {entry.get('minute', 0)}' - {entry.get('text', '')[:50]}...")
 
     def _finalize_match_result(self, match: Dict[str, Any]):
         """Finalize match result and notify Rust API."""
         match_id = match.get("match_id")
         
         # Get final scores
-        game = self.store.get_game(match_id)
+        game = self.store.get_fixture(match_id)
         if not game:
+            logger.warning(f"{match_id}: Cannot finalize - match not found")
             return
         
         home_score = game.get("home_score", 0)
@@ -488,10 +506,13 @@ class Poller:
         # Determine result
         if home_score > away_score:
             result = "home"
+            winner = game.get("home_team", "Home")
         elif away_score > home_score:
             result = "away"
+            winner = game.get("away_team", "Away")
         else:
             result = "draw"
+            winner = "None"
         
         # Forward final result to Rust API
         finalize_payload = {
@@ -499,6 +520,7 @@ class Poller:
             "result": result,
             "home_score": home_score,
             "away_score": away_score,
+            "winner": winner,
         }
         
         success = self.forwarder.finalize_match(finalize_payload)
@@ -511,24 +533,63 @@ class Poller:
 
     def _archive_completed_match(self, match_id: str):
         """Archive completed match to history (optional)."""
-        # This could call the Rust API's move-to-history endpoint
-        # Or handle it in the database directly
-        pass
+        try:
+            self.forwarder.move_to_history(match_id)
+            logger.debug(f"📦 {match_id}: Moved to history")
+        except Exception as e:
+            logger.debug(f"{match_id}: Move to history skipped: {e}")
 
     def _notify_match_live(self, match: Dict[str, Any]):
         """Send notification that match is now live."""
         match_id = match.get("match_id")
-        home_team = match.get("home_team", "")
-        away_team = match.get("away_team", "")
+        home_team = match.get("home_team", "Home")
+        away_team = match.get("away_team", "Away")
         
         notification = {
             "fixture_id": match_id,
             "event_type": "match_live",
             "title": f"⚽ {home_team} vs {away_team} is LIVE!",
             "body": f"Match is now live. Follow the action!",
+            "data": {
+                "home_team": home_team,
+                "away_team": away_team,
+                "fixture_id": match_id,
+                "type": "match_live"
+            }
         }
         self.forwarder.forward_notification(notification)
         logger.info(f"🔴 {match_id}: Match is now LIVE!")
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get poller status."""
+        try:
+            # Get fixture counts
+            all_fixtures = self.store.get_all_fixtures()
+            status_counts = {}
+            for match in all_fixtures:
+                status = match.get("status", "unknown")
+                status_counts[status] = status_counts.get(status, 0) + 1
+            
+            # Get lineups fetched count
+            lineups_fetched = 0
+            for match in all_fixtures:
+                if match.get("lineups_fetched", False):
+                    lineups_fetched += 1
+            
+            return {
+                "status": "running",
+                "poll_count": self.poll_count,
+                "total_fixtures": len(all_fixtures),
+                "status_counts": status_counts,
+                "lineups_fetched": lineups_fetched,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "error": str(e),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
 
 
 def main():
@@ -543,11 +604,24 @@ def main():
     forwarder = Forwarder(api_url)
     poller = Poller(store, forwarder)
 
+    # Check if we should run once or continuously
+    run_once = os.environ.get("POLLER_RUN_ONCE", "false").lower() == "true"
+    
     try:
-        poller.start()
+        if run_once:
+            # Run once and exit (for Cron Jobs)
+            logger.info("🚀 Poller running in ONCE mode...")
+            poller.poll_once()
+            logger.info("✅ Poller completed successfully")
+        else:
+            # Run continuously (for Background Worker)
+            poller.start()
     except KeyboardInterrupt:
         logger.info("Stopping poller...")
         poller.running = False
+    except Exception as e:
+        logger.error(f"❌ Poller failed: {e}")
+        sys.exit(1)
     finally:
         store.close()
 
