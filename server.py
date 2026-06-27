@@ -1,4 +1,6 @@
-# server.py
+"""
+Web server to keep the Render service alive and trigger poller via /poll endpoint.
+"""
 from flask import Flask, jsonify
 import subprocess
 import threading
@@ -30,28 +32,31 @@ def health():
 
 @app.route('/poll')
 def trigger_poller():
-    """Run the poller in the background."""
+    """Run the poller in the background and stream logs."""
     def run_poller():
         try:
             logger.info("🚀 Poller triggered via /poll endpoint")
-            # Run poller.py as a subprocess
-            result = subprocess.run(
+            
+            # Run poller and stream output in real-time
+            process = subprocess.Popen(
                 [sys.executable, 'poller.py'],
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
-                timeout=300  # 5 minutes max
+                bufsize=1  # Line buffered
             )
-            logger.info(f"✅ Poller finished: {result.returncode}")
-            if result.stdout:
-                logger.info(f"📤 Poller output: {result.stdout[:500]}")
-            if result.stderr:
-                logger.error(f"❌ Poller error: {result.stderr[:500]}")
-        except subprocess.TimeoutExpired:
-            logger.error("❌ Poller timed out after 5 minutes")
+            
+            # Read and log each line as it comes
+            for line in process.stdout:
+                logger.info(f"📤 {line.strip()}")
+            
+            # Wait for process to complete
+            process.wait()
+            logger.info(f"✅ Poller finished with code: {process.returncode}")
+            
         except Exception as e:
             logger.error(f"❌ Poller failed: {e}")
     
-    # Run in background thread so HTTP response is fast
     thread = threading.Thread(target=run_poller)
     thread.start()
     
@@ -67,13 +72,19 @@ def trigger_scraper():
     def run_scraper():
         try:
             logger.info("📋 Scraper triggered via /scrape endpoint")
-            result = subprocess.run(
+            process = subprocess.Popen(
                 [sys.executable, 'scraper.py'],
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
-                timeout=300
+                bufsize=1
             )
-            logger.info(f"✅ Scraper finished: {result.returncode}")
+            
+            for line in process.stdout:
+                logger.info(f"📤 {line.strip()}")
+            
+            process.wait()
+            logger.info(f"✅ Scraper finished with code: {process.returncode}")
         except Exception as e:
             logger.error(f"❌ Scraper failed: {e}")
     
