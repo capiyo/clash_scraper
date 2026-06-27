@@ -67,24 +67,49 @@ def fetch_games_by_competition(
 def fetch_game_details(game_id: str) -> Optional[Dict[str, Any]]:
     """
     Fetch detailed information for a specific game including scores, events, and commentary.
+    
+    NOTE: 365Scores may require a different endpoint for game details.
+    Try the fixtures endpoint with gameId filter.
     """
-    url = f"{BASE_URL}/web/games/details/"
+    # Try the fixtures endpoint with a single game ID
     params = {
         "appTypeId": 5,
         "langId": 1,
         "gameId": game_id,
         "showOdds": "true",
-        "includeEvents": "true",
-        "includeCommentary": "true",
     }
+
+    # Try different possible endpoints
+    endpoints = [
+        f"{BASE_URL}/web/games/details/",
+        f"{BASE_URL}/web/games/fixtures/",
+        f"{BASE_URL}/web/games/current/",
+    ]
     
-    try:
-        response = requests.get(url, headers=DEFAULT_HEADERS, params=params, timeout=30)
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to fetch game details for {game_id}: {e}")
-        return None
+    for url in endpoints:
+        try:
+            logger.debug(f"Trying to fetch game details from {url} with params {params}")
+            response = requests.get(url, headers=DEFAULT_HEADERS, params=params, timeout=30)
+            
+            if response.status_code == 200:
+                data = response.json()
+                # Check if we got game data
+                games = data.get("games", [])
+                if games:
+                    # Find the specific game
+                    for game in games:
+                        if str(game.get("id")) == game_id:
+                            logger.info(f"Found game details for {game_id}")
+                            return game
+                elif data.get("id") or data.get("gameId"):
+                    logger.info(f"Found game details for {game_id}")
+                    return data
+        except Exception as e:
+            logger.debug(f"Endpoint {url} failed: {e}")
+            continue
+    
+    logger.error(f"Failed to fetch game details for {game_id} from all endpoints")
+    return None
 
 
 def fetch_lineups(game_id: str) -> Optional[Dict[str, Any]]:
@@ -98,36 +123,50 @@ def fetch_lineups(game_id: str) -> Optional[Dict[str, Any]]:
                 "coach": {"name": "Coach Name"},
                 "players": [
                     {"name": "Player", "position": "GK", "jerseyNumber": 1, "captain": false},
-                    ...
                 ],
                 "bench": [...]
             },
             "away": {...}
         }
     """
-    url = f"{BASE_URL}/web/games/lineups/"
+    # Try different possible endpoints for lineups
+    endpoints = [
+        f"{BASE_URL}/web/games/lineups/",
+        f"{BASE_URL}/web/games/details/",
+    ]
+    
     params = {
         "appTypeId": 5,
         "langId": 1,
         "gameId": game_id,
     }
     
-    try:
-        response = requests.get(url, headers=DEFAULT_HEADERS, params=params, timeout=30)
-        response.raise_for_status()
-        
-        data = response.json()
-        lineups = data.get("lineups", {})
-        
-        # Transform to match Rust model structure
-        return _transform_lineups(lineups, game_id)
-        
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to fetch lineups for {game_id}: {e}")
-        return None
-    except ValueError as e:
-        logger.error(f"Failed to parse lineups JSON for {game_id}: {e}")
-        return None
+    for url in endpoints:
+        try:
+            logger.debug(f"Trying to fetch lineups from {url} with params {params}")
+            response = requests.get(url, headers=DEFAULT_HEADERS, params=params, timeout=30)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                # Check if this is the lineups endpoint with actual data
+                lineups = data.get("lineups")
+                if lineups:
+                    return _transform_lineups(lineups, game_id)
+                
+                # Maybe lineups are nested in the game data
+                games = data.get("games", [])
+                for game in games:
+                    if str(game.get("id")) == game_id:
+                        game_lineups = game.get("lineups")
+                        if game_lineups:
+                            return _transform_lineups(game_lineups, game_id)
+        except Exception as e:
+            logger.debug(f"Lineups endpoint {url} failed: {e}")
+            continue
+    
+    logger.debug(f"No lineups available for game {game_id}")
+    return None
 
 
 def _transform_lineups(raw_lineups: Dict, game_id: str) -> Dict[str, Any]:
@@ -135,10 +174,10 @@ def _transform_lineups(raw_lineups: Dict, game_id: str) -> Dict[str, Any]:
     Transform 365Scores lineup format to match Rust LineupsDocument struct.
     """
     result = {
-        "fixture_id": game_id,
+        "fixture_id": f"wc26_{game_id}",
         "lineups": {
             "home": {
-                "formation": "4-4-2",  # Default, 365Scores might not provide formation directly
+                "formation": "4-4-2",
                 "coach": {"name": raw_lineups.get("homeCoach", "Unknown")},
                 "players": [],
                 "bench": []
@@ -153,51 +192,47 @@ def _transform_lineups(raw_lineups: Dict, game_id: str) -> Dict[str, Any]:
     }
     
     # Parse home team players
-    home_players = raw_lineups.get("homePlayers", [])
-    for player in home_players:
+    for player in raw_lineups.get("homePlayers", []):
         result["lineups"]["home"]["players"].append({
             "name": player.get("name", ""),
             "position": player.get("position", ""),
             "jersey_number": player.get("jerseyNumber", 0),
             "captain": player.get("captain", False),
-            "lineup": player.get("lineup", "starting"),
-            "player_id": player.get("playerId", "")
+            "lineup": "starting",
+            "player_id": str(player.get("playerId", ""))
         })
     
     # Parse home bench
-    home_bench = raw_lineups.get("homeBench", [])
-    for player in home_bench:
+    for player in raw_lineups.get("homeBench", []):
         result["lineups"]["home"]["bench"].append({
             "name": player.get("name", ""),
             "position": player.get("position", ""),
             "jersey_number": player.get("jerseyNumber", 0),
             "captain": player.get("captain", False),
             "lineup": "bench",
-            "player_id": player.get("playerId", "")
+            "player_id": str(player.get("playerId", ""))
         })
     
     # Parse away team players
-    away_players = raw_lineups.get("awayPlayers", [])
-    for player in away_players:
+    for player in raw_lineups.get("awayPlayers", []):
         result["lineups"]["away"]["players"].append({
             "name": player.get("name", ""),
             "position": player.get("position", ""),
             "jersey_number": player.get("jerseyNumber", 0),
             "captain": player.get("captain", False),
             "lineup": "starting",
-            "player_id": player.get("playerId", "")
+            "player_id": str(player.get("playerId", ""))
         })
     
     # Parse away bench
-    away_bench = raw_lineups.get("awayBench", [])
-    for player in away_bench:
+    for player in raw_lineups.get("awayBench", []):
         result["lineups"]["away"]["bench"].append({
             "name": player.get("name", ""),
             "position": player.get("position", ""),
             "jersey_number": player.get("jerseyNumber", 0),
             "captain": player.get("captain", False),
             "lineup": "bench",
-            "player_id": player.get("playerId", "")
+            "player_id": str(player.get("playerId", ""))
         })
     
     return result
@@ -206,64 +241,56 @@ def _transform_lineups(raw_lineups: Dict, game_id: str) -> Dict[str, Any]:
 def fetch_statistics(game_id: str) -> Optional[Dict[str, Any]]:
     """
     Fetch match statistics for a specific game from 365Scores.
-    
-    Returns:
-        {
-            "fixture_id": "wc26_123",
-            "statistics": {
-                "home": {
-                    "possession": 55,
-                    "shots": 12,
-                    "shots_on_target": 5,
-                    "corners": 6,
-                    "fouls": 10,
-                    "yellow_cards": 2,
-                    "red_cards": 0
-                },
-                "away": {
-                    "possession": 45,
-                    "shots": 8,
-                    "shots_on_target": 3,
-                    "corners": 3,
-                    "fouls": 12,
-                    "yellow_cards": 1,
-                    "red_cards": 0
-                }
-            },
-            "minute": 67
-        }
     """
-    url = f"{BASE_URL}/web/games/statistics/"
+    # Try different possible endpoints for statistics
+    endpoints = [
+        f"{BASE_URL}/web/games/statistics/",
+        f"{BASE_URL}/web/games/details/",
+    ]
+    
     params = {
         "appTypeId": 5,
         "langId": 1,
         "gameId": game_id,
     }
     
-    try:
-        response = requests.get(url, headers=DEFAULT_HEADERS, params=params, timeout=30)
-        response.raise_for_status()
-        
-        data = response.json()
-        return _transform_statistics(data, game_id)
-        
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to fetch statistics for {game_id}: {e}")
-        return None
-    except ValueError as e:
-        logger.error(f"Failed to parse statistics JSON for {game_id}: {e}")
-        return None
+    for url in endpoints:
+        try:
+            logger.debug(f"Trying to fetch statistics from {url} with params {params}")
+            response = requests.get(url, headers=DEFAULT_HEADERS, params=params, timeout=30)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                # Check if this is the statistics endpoint
+                if "statistics" in data:
+                    return _transform_statistics(data, game_id)
+                
+                # Maybe statistics are nested in the game data
+                games = data.get("games", [])
+                for game in games:
+                    if str(game.get("id")) == game_id:
+                        game_stats = game.get("statistics")
+                        if game_stats:
+                            return _transform_statistics({"statistics": game_stats}, game_id)
+        except Exception as e:
+            logger.debug(f"Statistics endpoint {url} failed: {e}")
+            continue
+    
+    logger.debug(f"No statistics available for game {game_id}")
+    return None
 
 
 def _transform_statistics(raw_stats: Dict, game_id: str) -> Dict[str, Any]:
     """
     Transform 365Scores statistics format to match Rust model.
     """
-    home_stats = raw_stats.get("home", {})
-    away_stats = raw_stats.get("away", {})
+    stats_data = raw_stats.get("statistics", {})
+    home_stats = stats_data.get("home", {})
+    away_stats = stats_data.get("away", {})
     
     return {
-        "fixture_id": game_id,
+        "fixture_id": f"wc26_{game_id}",
         "statistics": {
             "home": {
                 "possession": home_stats.get("possession", 0),
@@ -303,17 +330,14 @@ def fetch_complete_match_data(game_id: str) -> Optional[Dict[str, Any]]:
         "statistics": None
     }
     
-    # Fetch details
     details = fetch_game_details(game_id)
     if details:
         result["details"] = details
     
-    # Fetch lineups
     lineups = fetch_lineups(game_id)
     if lineups:
         result["lineups"] = lineups
     
-    # Fetch statistics
     stats = fetch_statistics(game_id)
     if stats:
         result["statistics"] = stats
