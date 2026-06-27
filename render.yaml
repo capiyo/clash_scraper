@@ -1,0 +1,10 @@
+services:
+  - type: cron
+    name: worldcup-fixture-scraper
+    runtime: python
+    schedule: "0 */6 * * *"   # every 6 hours — adjust as needed
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python scraper.py"
+    envVars:
+      - key: MONGO_URI
+        sync: false   # set the real value in the Render dashboard, not here
