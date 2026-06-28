@@ -20,6 +20,7 @@ import logging
 import re
 import time
 import unicodedata
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -261,7 +262,58 @@ def fetch_live_commentary_by_id(match_id: str) -> List[Dict[str, Any]]:
     return []
 
 
+def _parse_minute(raw_time: str) -> int:
+    """
+    Flashscore's commentary time field is a string like '23', '45+2', or
+    possibly empty. Rust's CommentaryEntry.minute is a required i32 (no
+    Option), so this must always return *something* -- falls back to 0
+    rather than dropping the entry, since losing a real commentary line is
+    worse than mislabeling its minute as 0 in the rare unparseable case.
+    """
+    if not raw_time:
+        return 0
+    match = re.match(r"\d+", raw_time.strip())
+    if match:
+        try:
+            return int(match.group(0))
+        except ValueError:
+            return 0
+    return 0
+
+
+# Keyword -> event type, checked in order against the commentary text.
+# Rust's CommentaryEntry.event_type is a required String (no Option, no
+# server-side default), so every entry needs one of these -- "general" is
+# the fallback when no keyword matches. This is a heuristic on free text,
+# not a structured field from Flashscore, so it can occasionally
+# misclassify -- but it's strictly better than the same flat label on every
+# entry, since your own forward_commentary docstring lists exactly these
+# categories as what downstream (Flutter) expects to style differently.
+_TYPE_KEYWORDS = [
+    ("goal", ("⚽", "goal!", " scores", "scored")),
+    ("card", ("🟨", "🟥", "yellow card", "red card", "booked", "booking")),
+    ("substitution", ("🔄", "substitution", "comes on", "replaces")),
+    ("chance", ("🎯", "penalty", "missed", "chance", "saves", "save!")),
+]
+
+
+def _infer_event_type(text: str) -> str:
+    lowered = text.lower()
+    for event_type, keywords in _TYPE_KEYWORDS:
+        if any(kw.lower() in lowered for kw in keywords):
+            return event_type
+    return "general"
+
+
 def _parse_commentary(raw: str) -> List[Dict[str, Any]]:
+    """
+    Parses Flashscore's commentary feed into the exact shape Rust's
+    CommentaryEntry struct requires (see Game model: minute: i32 required,
+    type: String required (serde rename "type"), createdAt: BsonDateTime
+    required). All three were previously missing/mistyped (sent as
+    time/text/source), which is what caused every /games/commentary POST
+    to 422.
+    """
     entries = []
     for part in raw.split("¬~MB÷"):
         if not part.strip():
@@ -270,10 +322,20 @@ def _parse_commentary(raw: str) -> List[Dict[str, Any]]:
         text_match = re.search(r"¬MD÷([^¬]+)", part)
         text = (text_match.group(1) if text_match else "").replace("¬", "").strip()
         if text:
+            raw_time = (time_match.group(1) if time_match else "").strip()
             entries.append({
-                "time": (time_match.group(1) if time_match else "").strip(),
+                "minute": _parse_minute(raw_time),
                 "text": text,
-                "source": "flashscore",
+                "type": _infer_event_type(text),
+                "team": None,
+                "player": None,
+                # RFC3339 -- matches forward_live_update's working
+                # timestamp format (DateTime<Utc>). If Rust's BsonDateTime
+                # rejects this (different from chrono's DateTime<Utc>),
+                # the 422 body will show a deserialization error on this
+                # field specifically -- swap for Mongo extended JSON
+                # {"$date": <millis>} if so.
+                "createdAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             })
     return entries
 
