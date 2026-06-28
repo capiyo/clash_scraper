@@ -112,6 +112,16 @@ class FixtureStore:
             "completed_at": None,
             "moved_to_history": False,
             "created_at": datetime.now(timezone.utc),
+            # Flashscore cross-reference -- resolved lazily by poller.py once
+            # per fixture (name-match against Flashscore's schedule feed),
+            # not on every scrape. Nullable: a fixture is fully valid with
+            # this unset. Kept as a flat field, not an array/object of
+            # platform IDs, since there are exactly two sources today and a
+            # 1:1 relationship -- no need for a generalized multi-platform
+            # shape yet.
+            "flashscore_id": None,
+            "flashscore_resolved_at": None,
+            "flashscore_resolve_attempts": 0,
         }
 
         self._collection.update_one(
@@ -245,6 +255,54 @@ class FixtureStore:
             {"match_id": match_id},
             {"$set": {"last_polled_at": datetime.now(timezone.utc)}}
         )
+
+    # ============================================================
+    # FLASHSCORE CROSS-REFERENCE
+    # ============================================================
+    # flashscore_id is resolved once per fixture (name-match against
+    # Flashscore's own schedule feed) and persisted here, rather than
+    # re-resolved on every commentary fetch. This keeps the hot polling
+    # path (every 15s while live) to a plain field read instead of a
+    # name-matching pass against an in-memory map on every cycle.
+
+    def needs_flashscore_resolution(self, match: Dict[str, Any], max_attempts: int = 5) -> bool:
+        """
+        True if this fixture still needs its Flashscore ID resolved --
+        i.e. it doesn't have one yet, and hasn't already failed
+        max_attempts times (so a permanently-unmatchable name pair stops
+        being retried instead of hammering Flashscore's schedule feed
+        forever).
+        """
+        if match.get("flashscore_id"):
+            return False
+        return match.get("flashscore_resolve_attempts", 0) < max_attempts
+
+    def set_flashscore_id(self, match_id: str, flashscore_id: str) -> None:
+        """Persist a successfully resolved Flashscore match ID."""
+        self._collection.update_one(
+            {"match_id": match_id},
+            {
+                "$set": {
+                    "flashscore_id": flashscore_id,
+                    "flashscore_resolved_at": datetime.now(timezone.utc),
+                }
+            }
+        )
+
+    def record_flashscore_resolve_attempt(self, match_id: str) -> None:
+        """Record a failed resolution attempt (no match found this try)."""
+        self._collection.update_one(
+            {"match_id": match_id},
+            {"$inc": {"flashscore_resolve_attempts": 1}}
+        )
+
+    def get_flashscore_id(self, match_id: str) -> Optional[str]:
+        """Get the resolved Flashscore ID for a match, if any."""
+        doc = self._collection.find_one(
+            {"match_id": match_id},
+            {"flashscore_id": 1}
+        )
+        return doc.get("flashscore_id") if doc else None
 
     # ============================================================
     # LINEUPS

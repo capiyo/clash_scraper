@@ -15,7 +15,7 @@ from typing import Any, Dict, Optional
 
 from dotenv import load_dotenv
 
-from flashscore import fetch_live_commentary
+from flashscore import build_schedule_map, resolve_from_map, fetch_live_commentary_by_id
 from forwarder import Forwarder
 from mongo_store import FixtureStore
 from sources import threesixtyfive
@@ -38,6 +38,12 @@ SOON_THRESHOLD_MINUTES = 60  # 1 hour before kickoff = "soon"
 LINEUP_EARLY_THRESHOLD = 60  # Start checking at 60 mins before
 LINEUP_LATE_THRESHOLD = 40  # Stop checking at 40 mins before
 STATS_THRESHOLD_MINUTES = 10  # 10 minutes before kickoff = start stats
+
+# Flashscore name->ID resolution: rebuild the in-memory schedule map at
+# most this often. Resolution only runs for fixtures missing flashscore_id,
+# so this just bounds how stale the map can get during a long-running process.
+FLASHSCORE_MAP_TTL_SECONDS = 6 * 3600
+FLASHSCORE_MAX_RESOLVE_ATTEMPTS = 5
 
 
 class MatchStateMachine:
@@ -223,6 +229,13 @@ class Poller:
         self.running = False
         self.poll_count = 0
 
+        # Flashscore schedule map -- used ONLY by _resolve_flashscore_id().
+        # Built lazily on first need, rebuilt every FLASHSCORE_MAP_TTL
+        # seconds. NOT used by the commentary hot path, which reads the
+        # already-persisted flashscore_id straight from the fixture doc.
+        self._flashscore_map: Dict[tuple, str] = {}
+        self._flashscore_map_built_at: float = 0.0
+
     def start(self):
         """Start polling loop."""
         self.running = True
@@ -322,7 +335,10 @@ class Poller:
         if current_status == "live":
             self._fetch_live_updates(match)
 
-            # --- STEP 5: FETCH FLASHSCORE COMMENTARY (if live) ---
+            # --- STEP 5: RESOLVE FLASHSCORE ID (once per fixture) THEN
+            #             FETCH COMMENTARY (every cycle) ---
+            if self.store.needs_flashscore_resolution(match, FLASHSCORE_MAX_RESOLVE_ATTEMPTS):
+                self._resolve_flashscore_id(match)
             self._fetch_commentary(match)
 
         # --- STEP 6: CHECK COMPLETION ---
@@ -331,25 +347,70 @@ class Poller:
 
         self.store.record_last_poll(match_id)
 
-    def _fetch_commentary(self, match: Dict[str, Any]):
-        """Fetch live commentary from Flashscore using team names."""
+    def _ensure_flashscore_map(self):
+        """Build or refresh the in-memory Flashscore schedule map, used
+        only by _resolve_flashscore_id(). Does not touch MongoDB."""
+        age = time.time() - self._flashscore_map_built_at
+        if not self._flashscore_map or age > FLASHSCORE_MAP_TTL_SECONDS:
+            self._flashscore_map = build_schedule_map()
+            self._flashscore_map_built_at = time.time()
+
+    def _resolve_flashscore_id(self, match: Dict[str, Any]):
+        """
+        One-time resolution: match this fixture's 365Scores team names
+        against the Flashscore schedule map and persist the result.
+
+        Runs only while flashscore_id is still unset (and under the max
+        attempt cap) -- see FixtureStore.needs_flashscore_resolution().
+        After this succeeds once, _fetch_commentary() never calls this
+        again for this match_id; it just reads the stored ID.
+        """
         match_id = match.get("match_id")
         home_team = match.get("home_team")
         away_team = match.get("away_team")
 
         if not home_team or not away_team:
-            logger.debug(f"Missing team names for {match_id}, skipping commentary")
+            logger.debug(f"Missing team names for {match_id}, cannot resolve Flashscore ID")
+            return
+
+        self._ensure_flashscore_map()
+
+        fs_id = resolve_from_map(self._flashscore_map, home_team, away_team)
+
+        if fs_id:
+            self.store.set_flashscore_id(match_id, fs_id)
+            logger.info(f"🔗 {match_id}: resolved Flashscore ID {fs_id} ({home_team} vs {away_team})")
+        else:
+            self.store.record_flashscore_resolve_attempt(match_id)
+            attempts = match.get("flashscore_resolve_attempts", 0) + 1
+            logger.warning(
+                f"⚠️  {match_id}: no Flashscore match for {home_team} vs {away_team} "
+                f"(attempt {attempts}/{FLASHSCORE_MAX_RESOLVE_ATTEMPTS} -- "
+                f"check flashscore.py's _ALIASES if this persists)"
+            )
+
+    def _fetch_commentary(self, match: Dict[str, Any]):
+        """
+        Fetch live commentary from Flashscore using the already-resolved
+        flashscore_id. No name-matching happens here -- if flashscore_id
+        isn't set yet (still resolving, or permanently unmatched), this
+        just skips silently for this cycle.
+        """
+        match_id = match.get("match_id")
+        flashscore_id = match.get("flashscore_id") or self.store.get_flashscore_id(match_id)
+
+        if not flashscore_id:
+            logger.debug(f"No Flashscore ID yet for {match_id}, skipping commentary this cycle")
             return
 
         try:
-            commentary = fetch_live_commentary(home_team, away_team)
+            commentary = fetch_live_commentary_by_id(flashscore_id)
 
             if commentary:
                 logger.info(
                     f"📝 Got {len(commentary)} Flashscore commentary entries for {match_id}"
                 )
 
-                # Send each entry to Rust API
                 for entry in commentary:
                     self.forwarder.forward_commentary(
                         {
