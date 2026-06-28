@@ -243,7 +243,6 @@ def fetch_complete_match_data(
                 "shots": game.get("awayShots"),
                 "shots_on_target": game.get("awayShotsOnTarget"),
             },
-            "minute": game.get("gameTime", 0)
         },
         "score": {
             "home": game.get("homeCompetitor", {}).get("score", 0),
