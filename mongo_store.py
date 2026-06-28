@@ -1,5 +1,11 @@
 """
-MongoDB access for the poller. Matches the Rust Game struct exactly.
+MongoDB access for the poller. Field names match the Rust Game struct
+EXACTLY (camelCase, per each #[serde(rename = "...")]) -- this was
+previously broken: the file's docstring claimed to match Rust but every
+write/query used snake_case, causing every fixture document to fail
+deserialization on the Rust side ("invalid type: map, expected a string" /
+documents silently skipped in GET /api/games).
+
 Handles: fixtures, lineups, statistics, events, commentary, state management.
 """
 from __future__ import annotations
@@ -23,15 +29,16 @@ class FixtureStore:
         self._ensure_indexes()
 
     def _ensure_indexes(self):
-        """Create indexes for fast queries."""
+        """Create indexes for fast queries. Index keys use the same
+        camelCase field names actually stored on documents."""
         try:
-            self._collection.create_index("match_id", unique=True)
-            self._collection.create_index("threesixtyfive_game_id")
+            self._collection.create_index("matchId", unique=True)
+            self._collection.create_index("threesixtyfiveGameId")
             self._collection.create_index("status")
-            self._collection.create_index([("status", 1), ("is_live", 1)])
-            self._collection.create_index("kickoff_utc")
-            self._collection.create_index("scraped_at")
-            self._collection.create_index("forwarded_event_signatures")
+            self._collection.create_index([("status", 1), ("isLive", 1)])
+            self._collection.create_index("kickoffUtc")
+            self._collection.create_index("scrapedAt")
+            self._collection.create_index("forwardedEventSignatures")
             logger.info("MongoDB indexes ensured")
         except Exception as e:
             logger.warning(f"Index creation issue: {e}")
@@ -55,12 +62,25 @@ class FixtureStore:
         odds: dict = None,
     ) -> None:
         """
-        Upsert a fixture matching the Rust Game struct.
+        Upsert a fixture. Document keys match Rust's Game struct exactly
+        (see models/game.rs): matchId, homeTeam, awayTeam, kickoffUtc,
+        isLive, availableForVoting, homeWin/awayWin, scrapedAt, etc.
+
+        NOTE: Game.kickoff_utc is DateTime<Utc> -- a *required* field, not
+        Option -- so this must always be a real datetime, never None.
+        NOTE: Game.home_competitor_id / away_competitor_id / competition_id
+        are not actually fields on the Rust Game struct shown -- they're
+        kept here as Python-side bookkeeping (used by poller.py for
+        lineups/stats lookups against 365Scores) but are NOT part of the
+        camelCase Rust contract, so they're stored as-is (snake_case) since
+        Rust's deserializer will simply ignore unknown fields it doesn't
+        have a struct field for (serde's default behavior is to ignore
+        unrecognized keys, not error on them).
         """
         date_str = kickoff_utc.strftime("%Y-%m-%d")
         time_str = kickoff_utc.strftime("%H:%M")
         date_iso = kickoff_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
-        
+
         # Default odds to 1.0 if not provided
         home_win = 1.0
         away_win = 1.0
@@ -73,65 +93,69 @@ class FixtureStore:
         is_live = status == "live"
         available_for_voting = status in ("upcoming", "soon")
 
-        # Build the document
+        # Build the document -- camelCase keys matching Game's #[serde(rename)]
         doc = {
-            "match_id": match_id,
-            "threesixtyfive_game_id": threesixtyfive_game_id,
-            "home_team": home_team,
-            "away_team": away_team,
+            "matchId": match_id,
+            "threesixtyfiveGameId": threesixtyfive_game_id,
+            "homeTeam": home_team,
+            "awayTeam": away_team,
+            # Bookkeeping fields, not on the Rust struct -- harmless extras,
+            # ignored by serde on read. Kept snake_case to make clear
+            # they're Python-side only, not part of the Rust contract.
             "home_competitor_id": home_competitor_id,
             "away_competitor_id": away_competitor_id,
             "competition_id": competition_id,
             "league": competition_name,
             "date": date_str,
             "time": time_str,
-            "date_iso": date_iso,
-            "kickoff_utc": kickoff_utc,
-            "home_score": None,
-            "away_score": None,
+            "dateIso": date_iso,
+            "kickoffUtc": kickoff_utc,
+            "homeScore": None,
+            "awayScore": None,
             "status": status,
-            "is_live": is_live,
-            "available_for_voting": available_for_voting,
-            "home_win": home_win,
-            "away_win": away_win,
+            "isLive": is_live,
+            "availableForVoting": available_for_voting,
+            "homeWin": home_win,
+            "awayWin": away_win,
             "draw": draw,
-            "scraped_at": datetime.now(timezone.utc),
+            "scrapedAt": datetime.now(timezone.utc),
             "source": "365scores",
-            "last_scraped_at": datetime.now(timezone.utc),
+            "lastScrapedAt": datetime.now(timezone.utc),
         }
 
         # Fields that should ONLY be set on insert (user-generated data preserved)
         set_on_insert = {
             "votes": 0,
-            "comments": 0,
             "voters": [],
+            "comments": 0,
             "commentary": [],
-            "commentary_count": 0,
-            "last_commentary_at": None,
+            "commentaryCount": 0,
+            "lastCommentaryAt": None,
             "lineups": None,
-            "lineups_fetched": False,
-            "lineups_fetched_at": None,
+            "lineupsFetched": False,
+            "lineupsFetchedAt": None,
             "statistics": [],
-            "last_statistics_minute": None,
-            "forwarded_event_signatures": [],
-            "last_polled_at": None,
-            "completed_at": None,
-            "moved_to_history": False,
-            "created_at": datetime.now(timezone.utc),
+            "lastStatisticsMinute": None,
+            "forwardedEventSignatures": [],
+            "lastPolledAt": None,
+            "completedAt": None,
+            "movedToHistory": False,
+            "createdAt": datetime.now(timezone.utc),
+            "result": None,
+            "timeElapsed": None,
             # Flashscore cross-reference -- resolved lazily by poller.py once
             # per fixture (name-match against Flashscore's schedule feed),
             # not on every scrape. Nullable: a fixture is fully valid with
-            # this unset. Kept as a flat field, not an array/object of
-            # platform IDs, since there are exactly two sources today and a
-            # 1:1 relationship -- no need for a generalized multi-platform
-            # shape yet.
+            # this unset. NOT a Rust Game struct field -- Python/poller-side
+            # bookkeeping only, ignored by serde on read. Kept snake_case to
+            # signal that.
             "flashscore_id": None,
             "flashscore_resolved_at": None,
             "flashscore_resolve_attempts": 0,
         }
 
         self._collection.update_one(
-            {"match_id": match_id},
+            {"matchId": match_id},
             {
                 "$set": doc,
                 "$setOnInsert": set_on_insert,
@@ -141,7 +165,7 @@ class FixtureStore:
 
     def get_fixture(self, match_id: str) -> Optional[Dict[str, Any]]:
         """Get a single fixture by match_id."""
-        return self._collection.find_one({"match_id": match_id})
+        return self._collection.find_one({"matchId": match_id})
 
     def get_fixtures_by_status(self, status: str) -> List[Dict[str, Any]]:
         """Get all fixtures with a given status."""
@@ -156,7 +180,7 @@ class FixtureStore:
         now = datetime.now(timezone.utc)
         cutoff = now + timedelta(days=days_ahead)
         return list(self._collection.find({
-            "kickoff_utc": {"$gte": now, "$lte": cutoff}
+            "kickoffUtc": {"$gte": now, "$lte": cutoff}
         }))
 
     def get_active_fixtures(self) -> List[Dict[str, Any]]:
@@ -188,16 +212,16 @@ class FixtureStore:
         cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
         return list(self._collection.find({
             "status": "completed",
-            "completed_at": {"$lt": cutoff}
+            "completedAt": {"$lt": cutoff}
         }))
 
     def get_threesixtyfive_game_id(self, match_id: str) -> Optional[str]:
         """Get the 365Scores game ID for a match."""
         doc = self._collection.find_one(
-            {"match_id": match_id},
-            {"threesixtyfive_game_id": 1}
+            {"matchId": match_id},
+            {"threesixtyfiveGameId": 1}
         )
-        return doc.get("threesixtyfive_game_id") if doc else None
+        return doc.get("threesixtyfiveGameId") if doc else None
 
     def get_game(self, match_id: str) -> Optional[Dict[str, Any]]:
         """Get full game document (alias for get_fixture)."""
@@ -211,31 +235,31 @@ class FixtureStore:
         """Update match status."""
         is_live = status == "live"
         available_for_voting = status in ("upcoming", "soon")
-        
+
         update = {
             "status": status,
-            "is_live": is_live,
-            "available_for_voting": available_for_voting,
-            "scraped_at": datetime.now(timezone.utc),
+            "isLive": is_live,
+            "availableForVoting": available_for_voting,
+            "scrapedAt": datetime.now(timezone.utc),
         }
-        
+
         if status == "completed":
-            update["completed_at"] = datetime.now(timezone.utc)
-        
+            update["completedAt"] = datetime.now(timezone.utc)
+
         self._collection.update_one(
-            {"match_id": match_id},
+            {"matchId": match_id},
             {"$set": update}
         )
 
     def update_score(self, match_id: str, home_score: int, away_score: int) -> None:
         """Update score for a match."""
         self._collection.update_one(
-            {"match_id": match_id},
+            {"matchId": match_id},
             {
                 "$set": {
-                    "home_score": home_score,
-                    "away_score": away_score,
-                    "scraped_at": datetime.now(timezone.utc),
+                    "homeScore": home_score,
+                    "awayScore": away_score,
+                    "scrapedAt": datetime.now(timezone.utc),
                 }
             }
         )
@@ -243,8 +267,8 @@ class FixtureStore:
     def update_time_elapsed(self, match_id: str, time_elapsed: int) -> None:
         """Update the elapsed time for a match."""
         self._collection.update_one(
-            {"match_id": match_id},
-            {"$set": {"time_elapsed": time_elapsed}}
+            {"matchId": match_id},
+            {"$set": {"timeElapsed": time_elapsed}}
         )
 
     def mark_live(self, match_id: str) -> None:
@@ -256,10 +280,11 @@ class FixtureStore:
         self.update_status(match_id, "completed")
 
     def record_last_poll(self, match_id: str) -> None:
-        """Record last poll time."""
+        """Record last poll time. NOTE: lastPolledAt is not on the Rust
+        Game struct shown -- harmless extra field, ignored by serde."""
         self._collection.update_one(
-            {"match_id": match_id},
-            {"$set": {"last_polled_at": datetime.now(timezone.utc)}}
+            {"matchId": match_id},
+            {"$set": {"lastPolledAt": datetime.now(timezone.utc)}}
         )
 
     # ============================================================
@@ -270,6 +295,11 @@ class FixtureStore:
     # re-resolved on every commentary fetch. This keeps the hot polling
     # path (every 15s while live) to a plain field read instead of a
     # name-matching pass against an in-memory map on every cycle.
+    #
+    # These fields are NOT part of the Rust Game struct's camelCase
+    # contract -- kept snake_case deliberately, since they're Python/
+    # poller-side bookkeeping only. serde ignores unknown fields by
+    # default, so this causes no deserialization issues on the Rust side.
 
     def needs_flashscore_resolution(self, match: Dict[str, Any], max_attempts: int = 5) -> bool:
         """
@@ -286,7 +316,7 @@ class FixtureStore:
     def set_flashscore_id(self, match_id: str, flashscore_id: str) -> None:
         """Persist a successfully resolved Flashscore match ID."""
         self._collection.update_one(
-            {"match_id": match_id},
+            {"matchId": match_id},
             {
                 "$set": {
                     "flashscore_id": flashscore_id,
@@ -298,14 +328,14 @@ class FixtureStore:
     def record_flashscore_resolve_attempt(self, match_id: str) -> None:
         """Record a failed resolution attempt (no match found this try)."""
         self._collection.update_one(
-            {"match_id": match_id},
+            {"matchId": match_id},
             {"$inc": {"flashscore_resolve_attempts": 1}}
         )
 
     def get_flashscore_id(self, match_id: str) -> Optional[str]:
         """Get the resolved Flashscore ID for a match, if any."""
         doc = self._collection.find_one(
-            {"match_id": match_id},
+            {"matchId": match_id},
             {"flashscore_id": 1}
         )
         return doc.get("flashscore_id") if doc else None
@@ -313,17 +343,31 @@ class FixtureStore:
     # ============================================================
     # LINEUPS
     # ============================================================
+    # NOTE: Rust's Game.lineups is Option<LineupsDocument>, a TYPED
+    # struct (homeLineup/awayLineup, each with formation/coach/players/
+    # bench), not an arbitrary dict. If `lineups` here doesn't match that
+    # exact shape, Rust will fail to deserialize the whole Game document
+    # once this field is populated -- same class of bug as the field-name
+    # mismatch that caused the original "skipping malformed fixture" errors.
+    # The actual lineups write path in this codebase goes through the Rust
+    # API's own /games/lineups handler (store_lineups in games.rs), which
+    # builds the LineupsDocument shape correctly on the Rust side -- these
+    # Python-side methods are kept for local/back-compat use but should NOT
+    # be the primary write path while that Rust endpoint exists.
 
     def store_lineups(self, match_id: str, lineups: Dict) -> None:
-        """Store lineups and mark as fetched."""
+        """Store lineups and mark as fetched.
+        CAUTION: see note above -- prefer forwarding to the Rust
+        /games/lineups endpoint (already done via forwarder.py) over
+        writing this field directly from Python, to avoid shape drift."""
         self._collection.update_one(
-            {"match_id": match_id},
+            {"matchId": match_id},
             {
                 "$set": {
                     "lineups": lineups,
-                    "lineups_fetched": True,
-                    "lineups_fetched_at": datetime.now(timezone.utc),
-                    "scraped_at": datetime.now(timezone.utc),
+                    "lineupsFetched": True,
+                    "lineupsFetchedAt": datetime.now(timezone.utc),
+                    "scrapedAt": datetime.now(timezone.utc),
                 }
             },
             upsert=True,
@@ -332,44 +376,59 @@ class FixtureStore:
     def mark_lineups_fetched(self, match_id: str) -> None:
         """Mark that lineups have been fetched."""
         self._collection.update_one(
-            {"match_id": match_id},
-            {"$set": {"lineups_fetched": True, "lineups_fetched_at": datetime.now(timezone.utc)}}
+            {"matchId": match_id},
+            {"$set": {"lineupsFetched": True, "lineupsFetchedAt": datetime.now(timezone.utc)}}
         )
 
     def get_lineups(self, match_id: str) -> Optional[Dict]:
         """Get stored lineups for a match."""
         doc = self._collection.find_one(
-            {"match_id": match_id},
-            {"lineups": 1, "lineups_fetched": 1}
+            {"matchId": match_id},
+            {"lineups": 1, "lineupsFetched": 1}
         )
         return doc.get("lineups") if doc else None
 
     def lineups_available(self, match_id: str) -> bool:
         """Check if lineups are available for a match."""
         doc = self._collection.find_one(
-            {"match_id": match_id},
-            {"lineups_fetched": 1}
+            {"matchId": match_id},
+            {"lineupsFetched": 1}
         )
-        return doc.get("lineups_fetched", False) if doc else False
+        return doc.get("lineupsFetched", False) if doc else False
 
     # ============================================================
     # STATISTICS
     # ============================================================
+    # NOTE: Rust's Game.statistics is Vec<StatisticsSnapshot>, each with a
+    # TYPED `statistics: MatchStatistics { home: TeamStatistics, away:
+    # TeamStatistics }` shape -- not an arbitrary dict. As with lineups,
+    # the Rust API's own /games/statistics handlers (add_statistics_snapshot
+    # / bulk_update_statistics in games.rs) build this shape correctly.
+    # These Python methods write a generic `stats` dict directly and will
+    # cause the same deserialization failure if that dict doesn't match
+    # MatchStatistics's exact field names (possession, shots,
+    # shotsOnTarget, etc. -- check TeamStatisticsPayload's snake_case
+    # Deserialize impl specifically, since unlike Game/CommentaryEntry,
+    # TeamStatisticsPayload has NO #[serde(rename)] attributes, meaning it
+    # expects snake_case wire keys, not camelCase -- confirm against your
+    # actual struct before relying on this path).
 
     def add_statistics_snapshot(self, match_id: str, stats: Dict, minute: int) -> None:
-        """Add a statistics snapshot at a specific minute."""
+        """Add a statistics snapshot at a specific minute.
+        CAUTION: see note above -- prefer forwarding to the Rust
+        /games/statistics endpoint over writing this field directly."""
         snapshot = {
             "minute": minute,
             "statistics": stats,
             "timestamp": datetime.now(timezone.utc)
         }
         self._collection.update_one(
-            {"match_id": match_id},
+            {"matchId": match_id},
             {
                 "$push": {"statistics": snapshot},
                 "$set": {
-                    "last_statistics_minute": minute,
-                    "scraped_at": datetime.now(timezone.utc),
+                    "lastStatisticsMinute": minute,
+                    "scrapedAt": datetime.now(timezone.utc),
                 }
             },
             upsert=True,
@@ -378,7 +437,7 @@ class FixtureStore:
     def get_statistics(self, match_id: str) -> List[Dict]:
         """Get all statistics snapshots for a match."""
         doc = self._collection.find_one(
-            {"match_id": match_id},
+            {"matchId": match_id},
             {"statistics": 1}
         )
         return doc.get("statistics", []) if doc else []
@@ -386,7 +445,7 @@ class FixtureStore:
     def get_latest_statistics(self, match_id: str) -> Optional[Dict]:
         """Get the latest statistics snapshot for a match."""
         doc = self._collection.find_one(
-            {"match_id": match_id},
+            {"matchId": match_id},
             {"statistics": 1}
         )
         if doc and doc.get("statistics"):
@@ -397,63 +456,78 @@ class FixtureStore:
     # EVENTS
     # ============================================================
 
-    def get_forwarded_event_signatures(self, match_id: str) -> set[str]:
+    def get_forwarded_event_signatures(self, match_id: str) -> set:
         """Get the set of event signatures already forwarded."""
         doc = self._collection.find_one(
-            {"match_id": match_id},
-            {"forwarded_event_signatures": 1}
+            {"matchId": match_id},
+            {"forwardedEventSignatures": 1}
         )
         if not doc:
             return set()
-        return set(doc.get("forwarded_event_signatures", []))
+        return set(doc.get("forwardedEventSignatures", []))
 
     def add_forwarded_event_signature(self, match_id: str, signature: str) -> None:
         """Add a forwarded event signature."""
         self._collection.update_one(
-            {"match_id": match_id},
-            {"$addToSet": {"forwarded_event_signatures": signature}},
+            {"matchId": match_id},
+            {"$addToSet": {"forwardedEventSignatures": signature}},
             upsert=False,
         )
 
     def add_forwarded_event_signatures_bulk(self, match_id: str, signatures: List[str]) -> None:
         """Add multiple forwarded event signatures."""
         self._collection.update_one(
-            {"match_id": match_id},
-            {"$addToSet": {"forwarded_event_signatures": {"$each": signatures}}},
+            {"matchId": match_id},
+            {"$addToSet": {"forwardedEventSignatures": {"$each": signatures}}},
             upsert=False,
         )
 
     # ============================================================
     # COMMENTARY
     # ============================================================
+    # NOTE: Rust's CommentaryEntry struct requires minute: i32, type:
+    # String (renamed from event_type), createdAt: BsonDateTime -- all
+    # REQUIRED, no Option. The `entry` dict passed in here must already
+    # contain "minute", "type", "createdAt" (or this write will cause the
+    # same deserialization failure for this match's document once read
+    # back by Rust). flashscore.py's _parse_commentary() already produces
+    # this exact shape -- see that file's docstring.
 
     def add_commentary(self, match_id: str, entry: Dict) -> None:
-        """Add a commentary entry."""
+        """Add a commentary entry. `entry` must already match
+        CommentaryEntry's shape: minute (int), text (str), type (str),
+        team (optional str), player (optional str), createdAt (RFC3339 str
+        or compatible). createdAt is overwritten here to "now" regardless
+        of what's passed in, matching the Rust add_commentary handler's
+        own behavior (it does `entry.created_at = now` server-side too)."""
         now = datetime.now(timezone.utc)
-        entry["created_at"] = now
-        
+        entry = dict(entry)
+        entry["createdAt"] = now
+
         self._collection.update_one(
-            {"match_id": match_id},
+            {"matchId": match_id},
             {
                 "$push": {"commentary": entry},
-                "$inc": {"commentary_count": 1},
-                "$set": {"last_commentary_at": now, "scraped_at": now},
+                "$inc": {"commentaryCount": 1},
+                "$set": {"lastCommentaryAt": now, "scrapedAt": now},
             },
             upsert=True,
         )
 
     def add_commentary_bulk(self, match_id: str, entries: List[Dict]) -> None:
-        """Add multiple commentary entries."""
+        """Add multiple commentary entries. Each entry must already match
+        CommentaryEntry's shape (see add_commentary docstring)."""
         now = datetime.now(timezone.utc)
+        entries = [dict(e) for e in entries]
         for entry in entries:
-            entry["created_at"] = now
-        
+            entry["createdAt"] = now
+
         self._collection.update_one(
-            {"match_id": match_id},
+            {"matchId": match_id},
             {
                 "$push": {"commentary": {"$each": entries}},
-                "$inc": {"commentary_count": len(entries)},
-                "$set": {"last_commentary_at": now, "scraped_at": now},
+                "$inc": {"commentaryCount": len(entries)},
+                "$set": {"lastCommentaryAt": now, "scrapedAt": now},
             },
             upsert=True,
         )
@@ -461,7 +535,7 @@ class FixtureStore:
     def get_commentary(self, match_id: str, limit: int = 50) -> List[Dict]:
         """Get commentary for a match, sorted by minute."""
         pipeline = [
-            {"$match": {"match_id": match_id}},
+            {"$match": {"matchId": match_id}},
             {"$unwind": "$commentary"},
             {"$sort": {"commentary.minute": 1}},
             {"$limit": limit},
@@ -473,9 +547,9 @@ class FixtureStore:
     def get_latest_commentary(self, match_id: str, limit: int = 20) -> List[Dict]:
         """Get latest commentary for a match."""
         pipeline = [
-            {"$match": {"match_id": match_id}},
+            {"$match": {"matchId": match_id}},
             {"$unwind": "$commentary"},
-            {"$sort": {"commentary.created_at": -1}},
+            {"$sort": {"commentary.createdAt": -1}},
             {"$limit": limit},
             {"$project": {"commentary": 1, "_id": 0}}
         ]
@@ -489,17 +563,17 @@ class FixtureStore:
     def finalize_match(self, match_id: str, result: str, home_score: int, away_score: int) -> None:
         """Finalize a match with its result."""
         self._collection.update_one(
-            {"match_id": match_id},
+            {"matchId": match_id},
             {
                 "$set": {
                     "status": "completed",
-                    "is_live": False,
-                    "available_for_voting": False,
-                    "home_score": home_score,
-                    "away_score": away_score,
+                    "isLive": False,
+                    "availableForVoting": False,
+                    "homeScore": home_score,
+                    "awayScore": away_score,
                     "result": result,
-                    "completed_at": datetime.now(timezone.utc),
-                    "scraped_at": datetime.now(timezone.utc),
+                    "completedAt": datetime.now(timezone.utc),
+                    "scrapedAt": datetime.now(timezone.utc),
                 }
             }
         )
@@ -507,8 +581,8 @@ class FixtureStore:
     def move_to_history(self, match_id: str) -> None:
         """Mark a match as moved to history."""
         self._collection.update_one(
-            {"match_id": match_id},
-            {"$set": {"moved_to_history": True}}
+            {"matchId": match_id},
+            {"$set": {"movedToHistory": True}}
         )
 
     def archive_completed_fixtures(self, hours: int = 24) -> int:
@@ -517,27 +591,31 @@ class FixtureStore:
         result = self._collection.update_many(
             {
                 "status": "completed",
-                "completed_at": {"$lt": cutoff},
-                "moved_to_history": False,
+                "completedAt": {"$lt": cutoff},
+                "movedToHistory": False,
             },
-            {"$set": {"moved_to_history": True, "archived_at": datetime.now(timezone.utc)}}
+            {"$set": {"movedToHistory": True, "archivedAt": datetime.now(timezone.utc)}}
         )
         return result.modified_count
 
     # ============================================================
     # VOTERS & USER DATA
     # ============================================================
+    # NOTE: Rust's Voter struct requires userId, userName, selection,
+    # votedAt (camelCase, via #[serde(rename)]). The voter dict built here
+    # must match that exactly or this field will fail deserialization too.
 
     def add_voter(self, match_id: str, user_id: str, user_name: str, selection: str) -> None:
-        """Add a voter to a match."""
+        """Add a voter to a match. Matches Rust's Voter struct shape
+        exactly: userId, userName, selection, votedAt."""
         voter = {
-            "user_id": user_id,
-            "user_name": user_name,
+            "userId": user_id,
+            "userName": user_name,
             "selection": selection,
-            "voted_at": datetime.now(timezone.utc),
+            "votedAt": datetime.now(timezone.utc),
         }
         self._collection.update_one(
-            {"match_id": match_id},
+            {"matchId": match_id},
             {
                 "$push": {"voters": voter},
                 "$inc": {"votes": 1},
@@ -548,7 +626,7 @@ class FixtureStore:
     def get_voters(self, match_id: str) -> List[Dict]:
         """Get all voters for a match."""
         doc = self._collection.find_one(
-            {"match_id": match_id},
+            {"matchId": match_id},
             {"voters": 1}
         )
         return doc.get("voters", []) if doc else []
@@ -556,7 +634,7 @@ class FixtureStore:
     def get_vote_count(self, match_id: str) -> int:
         """Get the vote count for a match."""
         doc = self._collection.find_one(
-            {"match_id": match_id},
+            {"matchId": match_id},
             {"votes": 1}
         )
         return doc.get("votes", 0) if doc else 0
@@ -564,8 +642,8 @@ class FixtureStore:
     def user_has_voted(self, match_id: str, user_id: str) -> bool:
         """Check if a user has voted on a match."""
         doc = self._collection.find_one({
-            "match_id": match_id,
-            "voters.user_id": user_id
+            "matchId": match_id,
+            "voters.userId": user_id
         })
         return doc is not None
 
@@ -574,21 +652,24 @@ class FixtureStore:
     # ============================================================
 
     def upsert_fixtures_bulk(self, fixtures: List[Dict]) -> int:
-        """Bulk upsert fixtures."""
+        """Bulk upsert fixtures. CAUTION: each fixture dict is written
+        as-is via replace_one -- callers must ensure dicts already use
+        camelCase keys matching the Game struct (e.g. via upsert_fixture's
+        doc-building logic), or this bypasses the schema entirely."""
         operations = []
         for fixture in fixtures:
-            match_id = fixture.get("match_id")
+            match_id = fixture.get("matchId")
             if match_id:
                 operations.append(
                     {
                         "replace_one": {
-                            "filter": {"match_id": match_id},
+                            "filter": {"matchId": match_id},
                             "replacement": fixture,
                             "upsert": True,
                         }
                     }
                 )
-        
+
         if operations:
             result = self._collection.bulk_write(operations)
             return result.upserted_count + result.modified_count
@@ -602,8 +683,8 @@ class FixtureStore:
         """Delete fixtures older than N days (that are archived)."""
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         result = self._collection.delete_many({
-            "moved_to_history": True,
-            "completed_at": {"$lt": cutoff},
+            "movedToHistory": True,
+            "completedAt": {"$lt": cutoff},
         })
         return result.deleted_count
 
@@ -627,7 +708,7 @@ class FixtureStore:
         """Get upcoming fixtures that have lineups available."""
         return list(self._collection.find({
             "status": {"$in": ["upcoming", "soon"]},
-            "lineups_fetched": True
+            "lineupsFetched": True
         }))
 
     def get_live_fixtures_with_stats(self) -> List[Dict]:

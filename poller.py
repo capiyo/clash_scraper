@@ -66,7 +66,7 @@ class MatchStateMachine:
 
     def determine_state(self, match: Dict[str, Any]) -> str:
         """Determine the current state of a match based on kickoff time."""
-        kickoff_utc = match.get("kickoff_utc")
+        kickoff_utc = match.get("kickoffUtc")
         if not kickoff_utc:
             return match.get("status", "upcoming")
 
@@ -119,7 +119,7 @@ class MatchStateMachine:
         2. Match is in "soon" state AND within 40-60 minutes of kickoff
         3. OR match is "live" and lineups not fetched (we missed the window)
         """
-        match_id = match.get("match_id")
+        match_id = match.get("matchId")
 
         if match_id in self.lineups_fetched:
             return False
@@ -164,7 +164,7 @@ class MatchStateMachine:
     def should_update_status(self, match: Dict[str, Any]) -> Optional[str]:
         """Determine if match status should be updated."""
         current_status = match.get("status", "upcoming")
-        kickoff_utc = match.get("kickoff_utc")
+        kickoff_utc = match.get("kickoffUtc")
         minutes_to_kickoff = match.get("minutes_to_kickoff")
 
         if not kickoff_utc:
@@ -200,7 +200,7 @@ class MatchStateMachine:
 
     def should_finalize_result(self, match: Dict[str, Any]) -> bool:
         """Determine if we should finalize the match result."""
-        match_id = match.get("match_id")
+        match_id = match.get("matchId")
         status = match.get("status", "")
 
         if status != "completed":
@@ -265,15 +265,15 @@ class Poller:
 
     def _process_match(self, match: Dict[str, Any]):
         """Process a single match based on its state."""
-        match_id = match.get("match_id")
-        game_id = match.get("threesixtyfive_game_id")
+        match_id = match.get("matchId")
+        game_id = match.get("threesixtyfiveGameId")
 
         if not game_id:
             logger.warning(f"No 365Scores game_id for {match_id}, skipping")
             return
 
         # Calculate minutes until kickoff
-        kickoff_utc = match.get("kickoff_utc")
+        kickoff_utc = match.get("kickoffUtc")
         minutes_to_kickoff = None
 
         if kickoff_utc:
@@ -365,9 +365,9 @@ class Poller:
         After this succeeds once, _fetch_commentary() never calls this
         again for this match_id; it just reads the stored ID.
         """
-        match_id = match.get("match_id")
-        home_team = match.get("home_team")
-        away_team = match.get("away_team")
+        match_id = match.get("matchId")
+        home_team = match.get("homeTeam")
+        away_team = match.get("awayTeam")
 
         if not home_team or not away_team:
             logger.debug(f"Missing team names for {match_id}, cannot resolve Flashscore ID")
@@ -396,7 +396,7 @@ class Poller:
         isn't set yet (still resolving, or permanently unmatched), this
         just skips silently for this cycle.
         """
-        match_id = match.get("match_id")
+        match_id = match.get("matchId")
         flashscore_id = match.get("flashscore_id") or self.store.get_flashscore_id(match_id)
 
         if not flashscore_id:
@@ -426,8 +426,8 @@ class Poller:
 
     def _fetch_and_forward_lineups(self, match: Dict[str, Any]):
         """Fetch lineups and forward to Rust API using the new /web/game/ endpoint."""
-        match_id = match.get("match_id")
-        game_id = match.get("threesixtyfive_game_id")
+        match_id = match.get("matchId")
+        game_id = match.get("threesixtyfiveGameId")
 
         # Get competitor IDs from match data (stored during scraping)
         away_id = match.get("away_competitor_id")
@@ -466,8 +466,8 @@ class Poller:
 
     def _fetch_and_forward_statistics(self, match: Dict[str, Any]):
         """Fetch statistics and forward to Rust API."""
-        match_id = match.get("match_id")
-        game_id = match.get("threesixtyfive_game_id")
+        match_id = match.get("matchId")
+        game_id = match.get("threesixtyfiveGameId")
         away_id = match.get("away_competitor_id")
         home_id = match.get("home_competitor_id")
         competition_id = match.get("competition_id", 5930)
@@ -493,8 +493,8 @@ class Poller:
 
     def _fetch_live_updates(self, match: Dict[str, Any]):
         """Fetch live updates (scores, events, commentary)."""
-        match_id = match.get("match_id")
-        game_id = match.get("threesixtyfive_game_id")
+        match_id = match.get("matchId")
+        game_id = match.get("threesixtyfiveGameId")
         away_id = match.get("away_competitor_id")
         home_id = match.get("home_competitor_id")
         competition_id = match.get("competition_id", 5930)
@@ -543,7 +543,7 @@ class Poller:
 
     def _finalize_match_result(self, match: Dict[str, Any]):
         """Finalize match result and notify Rust API."""
-        match_id = match.get("match_id")
+        match_id = match.get("matchId")
 
         game = self.store.get_fixture(match_id)
         if not game:
@@ -574,9 +574,9 @@ class Poller:
 
     def _notify_match_live(self, match: Dict[str, Any]):
         """Send notification that match is now live."""
-        match_id = match.get("match_id")
-        home_team = match.get("home_team", "Home")
-        away_team = match.get("away_team", "Away")
+        match_id = match.get("matchId")
+        home_team = match.get("homeTeam", "Home")
+        away_team = match.get("awayTeam", "Away")
 
         notification = {
             "fixture_id": match_id,
