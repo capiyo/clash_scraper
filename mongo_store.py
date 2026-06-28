@@ -125,6 +125,17 @@ class FixtureStore:
 
         # Fields that should ONLY be set on insert (user-generated data preserved)
         set_on_insert = {
+            # CRITICAL: explicitly set _id to the same string as matchId.
+            # Without this, MongoDB auto-generates _id as a BSON ObjectId.
+            # Rust's Game.id field is `Option<String>` (#[serde(rename =
+            # "_id")]) -- an ObjectId does NOT deserialize into a plain
+            # String via serde (it needs bson::oid::ObjectId specifically,
+            # or a string representation). This single mismatched field
+            # was the actual cause of EVERY "invalid type: map, expected a
+            # string" / "skipping malformed fixture document" error, even
+            # after every other field was correctly renamed to camelCase --
+            # the camelCase fix was necessary but not sufficient.
+            "_id": match_id,
             "votes": 0,
             "voters": [],
             "comments": 0,
