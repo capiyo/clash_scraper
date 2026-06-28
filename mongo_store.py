@@ -109,7 +109,15 @@ class FixtureStore:
             "date": date_str,
             "time": time_str,
             "dateIso": date_iso,
-            "kickoffUtc": kickoff_utc,
+            # kickoffUtc is chrono::DateTime<Utc> on the Rust side (every
+            # OTHER timestamp field on Game is mongodb::bson::DateTime,
+            # which deserializes fine from a native BSON Date -- this one
+            # is the sole exception). chrono's serde Deserialize impl
+            # expects an RFC3339 string, not a raw BSON Date document, so
+            # this must be passed as a string, not a Python datetime
+            # object (which pymongo would otherwise encode as a native
+            # BSON Date and fail deserialization on the Rust side).
+            "kickoffUtc": kickoff_utc.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
             "homeScore": None,
             "awayScore": None,
             "status": status,
