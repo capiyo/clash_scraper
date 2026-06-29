@@ -113,6 +113,13 @@ STATS_THRESHOLD_MINUTES = 10  # 10 minutes before kickoff = start stats
 FLASHSCORE_MAP_TTL_SECONDS = 6 * 3600
 FLASHSCORE_MAX_RESOLVE_ATTEMPTS = 5
 
+# How often to check for completed fixtures that are ready to be archived
+# (movedToHistory=True). Archiving itself only touches fixtures whose
+# completedAt is older than ARCHIVE_AFTER_HOURS -- this just bounds how
+# often we run that query, since it doesn't need to run every 5s poll tick.
+ARCHIVE_CHECK_INTERVAL_SECONDS = 3600  # once an hour
+ARCHIVE_AFTER_HOURS = 24
+
 
 class MatchStateMachine:
     """
@@ -303,6 +310,7 @@ class Poller:
         # already-persisted flashscore_id straight from the fixture doc.
         self._flashscore_map: Dict[tuple, str] = {}
         self._flashscore_map_built_at: float = 0.0
+        self._last_archive_check: float = 0.0
 
     def start(self):
         """Start polling loop."""
@@ -330,6 +338,28 @@ class Poller:
 
         for match in all_fixtures:
             self._process_match(match)
+
+        self._maybe_archive_completed()
+
+    def _maybe_archive_completed(self):
+        """
+        Flip movedToHistory=True on completed fixtures older than
+        ARCHIVE_AFTER_HOURS. Throttled to ARCHIVE_CHECK_INTERVAL_SECONDS
+        since this doesn't need to run on every 5s poll tick -- it was
+        previously never called at all, which is why movedToHistory sat
+        at False forever even for long-finished matches.
+        """
+        now = time.time()
+        if now - self._last_archive_check < ARCHIVE_CHECK_INTERVAL_SECONDS:
+            return
+
+        self._last_archive_check = now
+        try:
+            archived = self.store.archive_completed_fixtures(hours=ARCHIVE_AFTER_HOURS)
+            if archived:
+                logger.info(f"🗄️ Archived {archived} completed fixture(s) to history")
+        except Exception as e:
+            logger.error(f"Failed to archive completed fixtures: {e}")
 
     def _process_match(self, match: Dict[str, Any]):
         """Process a single match based on its state."""
@@ -606,9 +636,10 @@ class Poller:
             self.store.update_score(match_id, home_score, away_score)
             logger.info(f"📊 {match_id}: Score updated {home_score}-{away_score}")
 
-        # Check if match ended
-        status_text = game.get("statusText", "").lower()
-        if status_text in ("finished", "ft", "ended", "full-time"):
+        # Check if match ended -- locale-proof (see threesixtyfive.is_game_finished
+        # docstring: statusText comes back in whatever lang_id was requested,
+        # so English string matching here used to never fire)
+        if threesixtyfive.is_game_finished(game):
             self.store.update_status(match_id, "completed")
             self._finalize_match_result(match)
             return

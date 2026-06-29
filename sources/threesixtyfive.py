@@ -23,6 +23,46 @@ DEFAULT_HEADERS = {
 }
 
 
+def is_game_finished(game: Dict[str, Any]) -> bool:
+    """
+    Determine if a game has finished -- without relying solely on
+    localized statusText.
+
+    fetch_game_details() defaults to lang_id=37 (Dutch), so statusText
+    can come back as e.g. "Eerste helft" (first half) instead of English.
+    Confirmed on 365scores.com that finished matches show the word
+    "Ended" -- so that's checked too, but isFinished/justEnded are
+    checked first since they don't depend on language at all.
+
+    Signals checked, in order:
+      1. game.chartEvents.statuses[0].isFinished -- explicit bool for
+         whatever the current statusId is
+      2. game.justEnded -- fires the moment a match ends
+      3. game.statusText.strip().lower() == "ended" (or other known
+         finished synonyms) -- confirmed real-world value from
+         365scores.com is "Ended"
+
+    Falls back to False (not finished) if none of these fire, since
+    that's the safer default (keeps polling rather than wrongly
+    archiving a live match).
+    """
+    try:
+        statuses = (game.get("chartEvents") or {}).get("statuses") or []
+        if statuses and "isFinished" in statuses[0]:
+            return bool(statuses[0]["isFinished"])
+    except (AttributeError, IndexError, TypeError):
+        pass
+
+    if game.get("justEnded"):
+        return True
+
+    status_text = (game.get("statusText") or "").strip().lower()
+    if status_text in ("ended", "finished", "ft", "full-time"):
+        return True
+
+    return False
+
+
 def fetch_games_by_competition(
     competition_ids: List[int],
     timezone_name: str = "Africa/Nairobi",
@@ -156,7 +196,27 @@ def fetch_lineups(
     if not home_lineups and not away_lineups:
         logger.debug(f"No lineups available for {game_id}")
         return None
-    
+
+    # Player names live in a separate top-level "members" array on the
+    # game object, keyed by the same "id" used inside lineups.members[].
+    # The lineup entries themselves never include a name field, so we
+    # have to join them here.
+    roster = {m["id"]: m for m in game.get("members", []) if "id" in m}
+
+    def _attach_names(lineup: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not lineup:
+            return {}
+        for player in lineup.get("members", []):
+            info = roster.get(player.get("id"))
+            if info:
+                player["name"] = info.get("name")
+                player["shortName"] = info.get("shortName")
+                player["athleteId"] = info.get("athleteId")
+        return lineup
+
+    home_lineups = _attach_names(home_lineups)
+    away_lineups = _attach_names(away_lineups)
+
     result = {
         "fixture_id": f"wc26_{game_id}",
         "home": home_lineups or {},
@@ -243,6 +303,7 @@ def fetch_complete_match_data(
                 "shots": game.get("awayShots"),
                 "shots_on_target": game.get("awayShotsOnTarget"),
             },
+            "minute": game.get("gameTime", 0)
         },
         "score": {
             "home": game.get("homeCompetitor", {}).get("score", 0),
