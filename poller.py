@@ -28,6 +28,74 @@ logging.basicConfig(
 )
 logger = logging.getLogger("worldcup_poller.poller")
 
+
+def _split_lineup_members(lineup: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convert a raw 365Scores lineup side
+    ({"formation": ..., "members": [...]}) into the shape
+    Forwarder.forward_lineups() / the Rust API expects:
+    {"formation": ..., "coach": {...}, "players": [...], "bench": [...]}
+
+    365Scores status codes (per member):
+      1 = Starting XI, 2 = Substitute, 4 = Management/Coach
+    """
+    players: list = []
+    bench: list = []
+    coach: Optional[Dict[str, Any]] = None
+
+    for m in lineup.get("members", []):
+        status = m.get("status")
+
+        if status == 4:
+            # Coaching staff entry, not a player
+            coach = {"name": m.get("name")}
+            continue
+
+        position = (m.get("formation") or {}).get("shortName") or \
+            (m.get("position") or {}).get("shortName")
+
+        entry = {
+            "player_id": str(m["id"]) if m.get("id") is not None else None,
+            "name": m.get("name"),
+            "position": position,
+            "jersey_number": None,  # not provided by 365Scores
+            "captain": False,       # not provided by 365Scores
+            "lineup": "starting" if status == 1 else "bench",
+        }
+
+        if status == 1:
+            players.append(entry)
+        else:
+            bench.append(entry)
+
+    return {
+        "formation": lineup.get("formation"),
+        "coach": coach,
+        "players": players,
+        "bench": bench,
+    }
+
+
+def _build_lineups_payload(
+    fixture_id: str, home_team: str, away_team: str, lineups: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Build the payload shape forward_lineups() documents:
+    {"fixture_id", "home_team", "away_team", "lineups": {"home": ..., "away": ...}}
+    threesixtyfive.fetch_lineups() returns {"fixture_id", "home", "away"} with
+    raw "members" arrays -- this reshapes that into what the Rust API wants.
+    """
+    return {
+        "fixture_id": fixture_id,
+        "home_team": home_team,
+        "away_team": away_team,
+        "lineups": {
+            "home": _split_lineup_members(lineups.get("home", {}) or {}),
+            "away": _split_lineup_members(lineups.get("away", {}) or {}),
+        },
+    }
+
+
 # Polling intervals (in seconds)
 POLL_INTERVAL_LIVE = 15  # Every 15 seconds for live matches
 POLL_INTERVAL_SOON = 60  # Every minute for soon matches
@@ -449,11 +517,15 @@ class Poller:
             )
 
             if lineups:
-                # Store in MongoDB
+                # Store in MongoDB (raw shape, for our own use)
                 self.store.store_lineups(match_id, lineups)
 
-                # Forward to Rust API
-                success = self.forwarder.forward_lineups(lineups)
+                # Reshape into what the Rust API actually expects before forwarding
+                home_team = match.get("homeTeam", "Home")
+                away_team = match.get("awayTeam", "Away")
+                payload = _build_lineups_payload(match_id, home_team, away_team, lineups)
+
+                success = self.forwarder.forward_lineups(payload)
                 if success:
                     self.store.mark_lineups_fetched(match_id)
                     logger.info(f"✅ Lineups fetched and forwarded for {match_id}")
@@ -483,13 +555,24 @@ class Poller:
         )
 
         if stats:
-            self.store.add_statistics_snapshot(
-                match_id,
-                stats.get("statistics", {}),
-                stats.get("minute", 0),
-            )
-            self.forwarder.forward_statistics(stats)
-            logger.debug(f"📊 Statistics forwarded for {match_id} at {stats.get('minute', 0)}'")
+            minute = stats.get("minute", 0)
+            statistics = {
+                "home": stats.get("home", {}),
+                "away": stats.get("away", {}),
+            }
+
+            self.store.add_statistics_snapshot(match_id, statistics, minute)
+
+            # fetch_statistics() returns {"home", "away", "minute"} with no
+            # fixture_id -- forward_statistics() needs {"fixture_id",
+            # "statistics": {"home", "away"}, "minute"}.
+            payload = {
+                "fixture_id": match_id,
+                "statistics": statistics,
+                "minute": minute,
+            }
+            self.forwarder.forward_statistics(payload)
+            logger.debug(f"📊 Statistics forwarded for {match_id} at {minute}'")
 
     def _fetch_live_updates(self, match: Dict[str, Any]):
         """Fetch live updates (scores, events, commentary)."""
