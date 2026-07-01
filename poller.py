@@ -49,25 +49,41 @@ def _split_lineup_members(lineup: Dict[str, Any]) -> Dict[str, Any]:
 
         if status == 4:
             # Coaching staff entry, not a player
-            coach = {"name": m.get("name")}
+            coach = {"name": m.get("name", "Unknown")}
             continue
 
         position = (m.get("formation") or {}).get("shortName") or \
             (m.get("position") or {}).get("shortName")
 
+        # Extract jersey number - 365Scores uses various field names
+        jersey_number = m.get("jerseyNumber") or m.get("jerseyNo") or m.get("number") or m.get("shirtNumber")
+        if jersey_number is None:
+            jersey_number = 0
+        else:
+            try:
+                jersey_number = int(jersey_number)
+            except (ValueError, TypeError):
+                jersey_number = 0
+
+        # Check if player is captain - 365Scores may have captain flag
+        is_captain = m.get("captain", False)
+        if isinstance(is_captain, str):
+            is_captain = is_captain.lower() == "true"
+
         entry = {
             "name": m.get("name", "Unknown"),
             "position": position or "Unknown",
-            "jerseyNumber": None,  # not provided by 365Scores
-            "captain": False,       # not provided by 365Scores
+            "jerseyNumber": jersey_number,
+            "captain": is_captain,
             "lineup": "starting" if status == 1 else "bench",
             "playerId": str(m["id"]) if m.get("id") is not None else None,
         }
 
         if status == 1:
             players.append(entry)
-        else:
+        elif status == 2:
             bench.append(entry)
+        # status == 4 (coach) already handled above
 
     return {
         "formation": lineup.get("formation", "4-4-2"),
