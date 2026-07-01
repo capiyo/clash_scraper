@@ -676,14 +676,18 @@ class Poller:
             self._finalize_match_result(match)
             return
 
-        # Forward live update
+        # Forward live update - FIXED: Added missing fields
+        minute = game.get("gameTime", 0)
         live_update = {
             "fixture_id": match_id,
             "event_type": "live_update",
             "home_score": home_score or 0,
             "away_score": away_score or 0,
-            "minute": game.get("gameTime", 0),
+            "minute": minute,
+            "minute_display": f"{minute}'" if minute > 0 else "0'",
             "status": "live",
+            "is_live": True,
+            "available_for_voting": False,
         }
         self.forwarder.forward_live_update(live_update)
 
