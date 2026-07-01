@@ -196,6 +196,15 @@ class MatchStateMachine:
         """
         match_id = match.get("matchId")
 
+        # Trust the persisted DB flag over the in-memory set: multiple
+        # poller processes/instances each have their own empty
+        # lineups_fetched set on boot, so relying on memory alone lets
+        # instances disagree. The DB flag is only set on a real,
+        # successfully-forwarded fetch (see _fetch_and_forward_lineups).
+        if match.get("lineupsFetched"):
+            self.lineups_fetched.add(match_id)
+            return False
+
         if match_id in self.lineups_fetched:
             return False
 
@@ -422,8 +431,9 @@ class Poller:
 
         # --- STEP 2: FETCH LINEUPS (if in soon state) ---
         if self.state_machine.should_fetch_lineups(match, current_status, minutes_to_kickoff):
-            self._fetch_and_forward_lineups(match)
-            self.state_machine.mark_lineups_done(match_id)
+            fetched = self._fetch_and_forward_lineups(match)
+            if fetched:
+                self.state_machine.mark_lineups_done(match_id)
 
         # --- STEP 3: FETCH STATISTICS (if live or soon near kickoff) ---
         if self.state_machine.should_fetch_statistics(match, current_status, minutes_to_kickoff):
@@ -522,8 +532,15 @@ class Poller:
         except Exception as e:
             logger.error(f"❌ Failed to fetch Flashscore commentary for {match_id}: {e}")
 
-    def _fetch_and_forward_lineups(self, match: Dict[str, Any]):
-        """Fetch lineups and forward to Rust API using the new /web/game/ endpoint."""
+    def _fetch_and_forward_lineups(self, match: Dict[str, Any]) -> bool:
+        """Fetch lineups and forward to Rust API using the new /web/game/ endpoint.
+
+        Returns True only when lineups were actually fetched AND successfully
+        forwarded/persisted. The caller (_process_match) uses this to decide
+        whether it's safe to mark lineups as "done" for this match -- if we
+        return False (source has nothing yet, missing IDs, forward failed, or
+        an exception), the caller will keep retrying on subsequent cycles.
+        """
         match_id = match.get("matchId")
         game_id = match.get("threesixtyfiveGameId")
 
@@ -534,7 +551,7 @@ class Poller:
 
         if not all([game_id, away_id, home_id]):
             logger.warning(f"Missing competitor IDs for {match_id}, cannot fetch lineups")
-            return
+            return False
 
         logger.info(f"📋 Fetching lineups for {match_id}...")
 
@@ -567,12 +584,14 @@ class Poller:
                 if success:
                     self.store.mark_lineups_fetched(match_id)
                     logger.info(f"✅ Lineups fetched and forwarded for {match_id}")
-                else:
-                    logger.warning(f"⚠️ Failed to forward lineups for {match_id}")
-            else:
-                logger.debug(f"No lineups available yet for {match_id}")
+                    return True
+                logger.warning(f"⚠️ Failed to forward lineups for {match_id}")
+                return False
+            logger.debug(f"No lineups available yet for {match_id}")
+            return False
         except Exception as e:
             logger.error(f"❌ Failed to fetch lineups for {match_id}: {e}")
+            return False
 
     def _fetch_and_forward_statistics(self, match: Dict[str, Any]):
         """Fetch statistics and forward to Rust API."""
