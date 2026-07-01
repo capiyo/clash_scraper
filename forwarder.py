@@ -83,22 +83,22 @@ class Forwarder:
     # ============================================================
 
     def forward_live_update(self, update: Dict[str, Any]) -> bool:
-        """Forward a live match update to the Rust API."""
-        # Ensure all required fields are present
+        """
+        Forward a live match update to the Rust API.
+        Rust expects camelCase field names.
+        """
         payload = {
-            "fixture_id": update.get("fixture_id"),
-            "event_type": update.get("event_type", "live_update"),
-            "home_score": update.get("home_score", 0),
-            "away_score": update.get("away_score", 0),
+            "fixtureId": update.get("fixture_id"),
+            "eventType": update.get("event_type", "live_update"),
+            "homeScore": update.get("home_score", 0),
+            "awayScore": update.get("away_score", 0),
             "minute": update.get("minute", 0),
-            "minute_display": update.get("minute_display", f"{update.get('minute', 0)}'"),
+            "minuteDisplay": update.get("minute_display", f"{update.get('minute', 0)}'"),
             "status": update.get("status", "live"),
+            "isLive": update.get("is_live", True),
+            "availableForVoting": update.get("available_for_voting", False),
         }
-        # Add optional fields if present
-        if "is_live" in update:
-            payload["is_live"] = update["is_live"]
-        if "available_for_voting" in update:
-            payload["available_for_voting"] = update["available_for_voting"]
+        # Optional fields
         if "scorer" in update:
             payload["scorer"] = update["scorer"]
         if "player" in update:
@@ -147,8 +147,10 @@ class Forwarder:
     # ============================================================
 
     def forward_commentary(self, commentary: Dict[str, Any]) -> bool:
-        """Forward commentary to the Rust API."""
-        # Ensure entry has all required fields
+        """
+        Forward commentary to the Rust API.
+        Rust expects "createdAt" (camelCase).
+        """
         entry = commentary.get("entry", {})
         payload = {
             "match_id": commentary.get("match_id"),
@@ -158,7 +160,7 @@ class Forwarder:
                 "type": entry.get("type", "general"),
                 "team": entry.get("team"),
                 "player": entry.get("player"),
-                "created_at": entry.get("created_at", datetime.now(timezone.utc).isoformat())
+                "createdAt": entry.get("created_at", datetime.now(timezone.utc).isoformat()),
             }
         }
         return self._post("/games/commentary", payload)
@@ -175,7 +177,10 @@ class Forwarder:
     # ============================================================
 
     def forward_lineups(self, lineups: Dict[str, Any]) -> bool:
-        """Forward lineups to the Rust API."""
+        """
+        Forward lineups to the Rust API.
+        Rust expects camelCase field names.
+        """
         payload = {
             "fixtureId": lineups.get("fixture_id"),
             "homeTeam": lineups.get("home_team"),
@@ -196,17 +201,44 @@ class Forwarder:
         return self._post("/games/lineups/simplified", payload)
 
     # ============================================================
-    # STATISTICS - FIXED
+    # STATISTICS
     # ============================================================
 
     def forward_statistics(self, statistics: Dict[str, Any]) -> bool:
-        """Forward match statistics to the Rust API."""
+        """
+        Forward match statistics to the Rust API.
+        Rust expects snake_case field names.
+        """
         payload = {
             "fixture_id": statistics.get("fixture_id"),
             "minute": statistics.get("minute", 0),
             "statistics": {
-                "home": statistics.get("statistics", {}).get("home", {}),
-                "away": statistics.get("statistics", {}).get("away", {})
+                "home": {
+                    "possession": statistics.get("statistics", {}).get("home", {}).get("possession"),
+                    "shots": statistics.get("statistics", {}).get("home", {}).get("shots"),
+                    "shots_on_target": statistics.get("statistics", {}).get("home", {}).get("shots_on_target"),
+                    "shots_off_target": statistics.get("statistics", {}).get("home", {}).get("shots_off_target"),
+                    "corners": statistics.get("statistics", {}).get("home", {}).get("corners"),
+                    "fouls": statistics.get("statistics", {}).get("home", {}).get("fouls"),
+                    "yellow_cards": statistics.get("statistics", {}).get("home", {}).get("yellow_cards"),
+                    "red_cards": statistics.get("statistics", {}).get("home", {}).get("red_cards"),
+                    "offsides": statistics.get("statistics", {}).get("home", {}).get("offsides"),
+                    "passes": statistics.get("statistics", {}).get("home", {}).get("passes"),
+                    "pass_accuracy": statistics.get("statistics", {}).get("home", {}).get("pass_accuracy"),
+                },
+                "away": {
+                    "possession": statistics.get("statistics", {}).get("away", {}).get("possession"),
+                    "shots": statistics.get("statistics", {}).get("away", {}).get("shots"),
+                    "shots_on_target": statistics.get("statistics", {}).get("away", {}).get("shots_on_target"),
+                    "shots_off_target": statistics.get("statistics", {}).get("away", {}).get("shots_off_target"),
+                    "corners": statistics.get("statistics", {}).get("away", {}).get("corners"),
+                    "fouls": statistics.get("statistics", {}).get("away", {}).get("fouls"),
+                    "yellow_cards": statistics.get("statistics", {}).get("away", {}).get("yellow_cards"),
+                    "red_cards": statistics.get("statistics", {}).get("away", {}).get("red_cards"),
+                    "offsides": statistics.get("statistics", {}).get("away", {}).get("offsides"),
+                    "passes": statistics.get("statistics", {}).get("away", {}).get("passes"),
+                    "pass_accuracy": statistics.get("statistics", {}).get("away", {}).get("pass_accuracy"),
+                }
             }
         }
         return self._post("/games/statistics", payload)
@@ -219,8 +251,32 @@ class Forwarder:
             "fixture_id": fixture_id,
             "minute": minute,
             "statistics": {
-                "home": stats.get("home", {}),
-                "away": stats.get("away", {})
+                "home": {
+                    "possession": stats.get("home", {}).get("possession"),
+                    "shots": stats.get("home", {}).get("shots"),
+                    "shots_on_target": stats.get("home", {}).get("shots_on_target"),
+                    "shots_off_target": stats.get("home", {}).get("shots_off_target"),
+                    "corners": stats.get("home", {}).get("corners"),
+                    "fouls": stats.get("home", {}).get("fouls"),
+                    "yellow_cards": stats.get("home", {}).get("yellow_cards"),
+                    "red_cards": stats.get("home", {}).get("red_cards"),
+                    "offsides": stats.get("home", {}).get("offsides"),
+                    "passes": stats.get("home", {}).get("passes"),
+                    "pass_accuracy": stats.get("home", {}).get("pass_accuracy"),
+                },
+                "away": {
+                    "possession": stats.get("away", {}).get("possession"),
+                    "shots": stats.get("away", {}).get("shots"),
+                    "shots_on_target": stats.get("away", {}).get("shots_on_target"),
+                    "shots_off_target": stats.get("away", {}).get("shots_off_target"),
+                    "corners": stats.get("away", {}).get("corners"),
+                    "fouls": stats.get("away", {}).get("fouls"),
+                    "yellow_cards": stats.get("away", {}).get("yellow_cards"),
+                    "red_cards": stats.get("away", {}).get("red_cards"),
+                    "offsides": stats.get("away", {}).get("offsides"),
+                    "passes": stats.get("away", {}).get("passes"),
+                    "pass_accuracy": stats.get("away", {}).get("pass_accuracy"),
+                }
             }
         }
         return self._post("/games/statistics/snapshot", payload)
