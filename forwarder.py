@@ -62,16 +62,22 @@ class Forwarder:
             return None
 
     def _format_timestamp(self, ts) -> str:
-        """Format timestamp for Rust DateTime<Utc> - MUST include timezone"""
+        """Format timestamp for Rust BsonDateTime - MUST have milliseconds and timezone"""
         if ts is None:
-            return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+            return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
         if isinstance(ts, datetime):
-            return ts.isoformat().replace('+00:00', 'Z')
+            return ts.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
         if isinstance(ts, str):
+            # Clean up the string
+            ts = ts.replace('+00:00', 'Z')
+            if '.' not in ts:
+                # Add milliseconds if missing
+                ts = ts.replace('Z', '').replace('+00:00', '')
+                ts = ts + ".000Z"
             if not ts.endswith('Z') and '+' not in ts:
-                return ts + 'Z'
+                ts = ts + "Z"
             return ts
-        return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
     def _clean(self, data: Dict) -> Dict:
         """Remove None values from payload"""
@@ -104,35 +110,65 @@ class Forwarder:
         return self._post("/games/live-update", payload)
 
     # ============================================================
-    # COMMENTARY - MATCHES RUST CommentaryEntry
+    # COMMENTARY - MATCHES RUST CommentaryUpdate
     # ============================================================
 
     def forward_commentary(self, commentary: Dict[str, Any]) -> bool:
         """
-        Rust expects CommentaryEntry with:
-        - "type" (NOT "event_type")
-        - "createdAt" (NOT "created_at")
+        Forward commentary to Rust API.
+        Rust expects CommentaryUpdate with:
+        - match_id: String
+        - entry: CommentaryEntry with:
+            - minute: i32
+            - text: String
+            - type: String (NOT event_type)
+            - team: Option<String>
+            - player: Option<String>
+            - createdAt: BsonDateTime (with milliseconds and timezone)
         """
         entry = commentary.get("entry", {})
+        match_id = commentary.get("match_id")
+        
+        if not match_id:
+            logger.error("Missing match_id in commentary")
+            return False
+        
+        # Ensure minute is int
+        try:
+            minute = int(entry.get("minute", 0))
+        except (ValueError, TypeError):
+            minute = 0
+        
+        # Ensure text is string
+        text = str(entry.get("text", ""))
+        
+        # Ensure type is correct (use "type" field, fallback to "event_type")
+        event_type = entry.get("type")
+        if not event_type:
+            event_type = entry.get("event_type")
+        if not event_type:
+            event_type = "commentary"
+        event_type = str(event_type)
+        
+        # Format timestamp for BsonDateTime - with milliseconds and timezone
+        created_at = entry.get("createdAt")
+        if not created_at:
+            created_at = entry.get("created_at")
+        created_at = self._format_timestamp(created_at)
         
         payload = {
-            "match_id": commentary.get("match_id"),
+            "match_id": str(match_id),
             "entry": self._clean({
-                "minute": int(entry.get("minute", 0)),
-                "text": str(entry.get("text", "")),
-                "type": entry.get("type") or entry.get("event_type") or "general",
+                "minute": minute,
+                "text": text,
+                "type": event_type,
                 "team": entry.get("team"),
                 "player": entry.get("player"),
-                "createdAt": self._format_timestamp(
-                    entry.get("createdAt") or entry.get("created_at")
-                ),
+                "createdAt": created_at,
             })
         }
         
-        if payload.get("match_id") is None:
-            logger.error("Missing match_id in commentary")
-            return False
-            
+        logger.debug(f"📤 Commentary payload: {payload}")
         return self._post("/games/commentary", payload)
 
     # ============================================================
@@ -254,6 +290,13 @@ class Forwarder:
         })
         return self._post("/games/events", payload)
 
+    def forward_commentary_bulk(self, fixture_id: str, entries: List[Dict[str, Any]]) -> bool:
+        payload = {
+            "match_id": fixture_id,
+            "entries": entries
+        }
+        return self._post("/games/commentary/bulk", payload)
+
     def forward_notification(self, notification: Dict[str, Any]) -> bool:
         payload = self._clean({
             "fixtureId": notification.get("fixtureId") or notification.get("fixture_id"),
@@ -263,6 +306,103 @@ class Forwarder:
             "data": notification.get("data"),
         })
         return self._post("/games/notify", payload)
+
+    def forward_match_result(self, fixture_id: str, result: str, home_score: int, away_score: int) -> bool:
+        payload = {
+            "fixtureId": fixture_id,
+            "result": result,
+            "homeScore": int(home_score),
+            "awayScore": int(away_score),
+        }
+        return self._post("/games/result", payload)
+
+    def move_to_history(self, fixture_id: str) -> bool:
+        return self._post(f"/games/{fixture_id}/move-to-history", {})
+
+    def forward_lineups_simplified(self, fixture_id: str, home_players: List[Dict], away_players: List[Dict]) -> bool:
+        payload = {
+            "fixtureId": fixture_id,
+            "home": home_players,
+            "away": away_players,
+        }
+        return self._post("/games/lineups/simplified", payload)
+
+    def forward_statistics_bulk(self, stats_bulk: Dict[str, Any]) -> bool:
+        return self._post("/games/statistics/bulk", stats_bulk)
+
+    def forward_statistics_snapshot(self, fixture_id: str, minute: int, stats: Dict[str, Any]) -> bool:
+        payload = {
+            "fixture_id": fixture_id,
+            "minute": int(minute),
+            "statistics": {
+                "home": self._clean(stats.get("home", {})),
+                "away": self._clean(stats.get("away", {})),
+            }
+        }
+        return self._post("/games/statistics/snapshot", payload)
+
+    def forward_lineups_available_notification(self, fixture_id: str, home_team: str, away_team: str) -> bool:
+        payload = {
+            "fixtureId": fixture_id,
+            "eventType": "lineups_available",
+            "title": f"📋 Lineups are out! {home_team} vs {away_team}",
+            "body": f"Check the starting XI for {home_team} vs {away_team}.",
+            "data": {
+                "home_team": home_team,
+                "away_team": away_team,
+                "type": "lineups_available"
+            }
+        }
+        return self._post("/games/notify", payload)
+
+    def forward_match_live_notification(self, fixture_id: str, home_team: str, away_team: str) -> bool:
+        payload = {
+            "fixtureId": fixture_id,
+            "eventType": "match_live",
+            "title": f"⚽ {home_team} vs {away_team} is LIVE!",
+            "body": "Match is now live. Follow the action!",
+            "data": {
+                "home_team": home_team,
+                "away_team": away_team,
+                "type": "match_live"
+            }
+        }
+        return self._post("/games/notify", payload)
+
+    def forward_goal_notification(self, fixture_id: str, scorer: str, minute: int, home_score: int, away_score: int) -> bool:
+        payload = {
+            "fixtureId": fixture_id,
+            "eventType": "goal_scored",
+            "title": f"⚽ GOAL! {scorer} scores!",
+            "body": f"{scorer} scores at {minute}'! Score: {home_score}-{away_score}",
+            "data": {
+                "scorer": scorer,
+                "minute": minute,
+                "home_score": home_score,
+                "away_score": away_score,
+                "type": "goal_scored"
+            }
+        }
+        return self._post("/games/notify", payload)
+
+    def forward_match_ended_notification(self, fixture_id: str, home_team: str, away_team: str, result: str) -> bool:
+        payload = {
+            "fixtureId": fixture_id,
+            "eventType": "match_ended",
+            "title": f"🏁 Full Time: {home_team} vs {away_team}",
+            "body": f"Match ended. Result: {result}",
+            "data": {
+                "home_team": home_team,
+                "away_team": away_team,
+                "result": result,
+                "type": "match_ended"
+            }
+        }
+        return self._post("/games/notify", payload)
+
+    # ============================================================
+    # GAME MANAGEMENT
+    # ============================================================
 
     def get_game(self, match_id: str) -> Optional[Dict[str, Any]]:
         return self._get(f"/games/match/{match_id}")
@@ -281,6 +421,10 @@ class Forwarder:
 
     def sync_live_data(self, live_data: Dict[str, Any]) -> bool:
         return self._post("/games/sync/live", live_data)
+
+    # ============================================================
+    # HEALTH CHECK
+    # ============================================================
 
     def health_check(self) -> bool:
         result = self._get("/health")
