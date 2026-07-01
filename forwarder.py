@@ -1,3 +1,4 @@
+
 """
 Forwards updates from poller to Rust backend API.
 Handles: fixtures, live updates, events, commentary, lineups, statistics, finalization, notifications.
@@ -79,39 +80,29 @@ class Forwarder:
         return self._post("/games/bulk", {"fixtures": fixtures})
 
     # ============================================================
-    # LIVE UPDATES - FIXED
+    # LIVE UPDATES
     # ============================================================
 
     def forward_live_update(self, update: Dict[str, Any]) -> bool:
-       if "timestamp" not in update:
-        update["timestamp"] = datetime.now(timezone.utc).isoformat()
-       payload = {
-        "fixtureId": update.get("fixture_id"),
-        "eventType": update.get("event_type"),
-        "homeScore": update.get("home_score", 0),
-        "awayScore": update.get("away_score", 0),
-        "minute": update.get("minute", 0),
-        "minuteDisplay": update.get("minute_display"),
-        "status": update.get("status"),
-        "isLive": update.get("is_live"),
-        "availableForVoting": update.get("available_for_voting"),
-        "scorer": update.get("scorer"),
-        "player": update.get("player"),
-        "assist": update.get("assist"),
-        "team": update.get("team"),
-        "timestamp": update.get("timestamp"),
-    }
-       return self._post("/games/live-update", payload)
-
-def forward_commentary(self, commentary: Dict[str, Any]) -> bool:
-    entry = dict(commentary.get("entry", {}))
-    if "created_at" in entry:
-        entry["createdAt"] = entry.pop("created_at")
-    entry.setdefault("createdAt", datetime.now(timezone.utc).isoformat())
-    if "event_type" in entry:
-        entry["type"] = entry.pop("event_type")
-    payload = {"match_id": commentary.get("match_id"), "entry": entry}
-    return self._post("/games/commentary", payload)
+        if "timestamp" not in update:
+            update["timestamp"] = datetime.now(timezone.utc).isoformat()
+        payload = {
+            "fixtureId": update.get("fixture_id"),
+            "eventType": update.get("event_type"),
+            "homeScore": update.get("home_score", 0),
+            "awayScore": update.get("away_score", 0),
+            "minute": update.get("minute", 0),
+            "minuteDisplay": update.get("minute_display"),
+            "status": update.get("status"),
+            "isLive": update.get("is_live"),
+            "availableForVoting": update.get("available_for_voting"),
+            "scorer": update.get("scorer"),
+            "player": update.get("player"),
+            "assist": update.get("assist"),
+            "team": update.get("team"),
+            "timestamp": update.get("timestamp"),
+        }
+        return self._post("/games/live-update", payload)
 
     def forward_score_update(self, match_id: str, home_score: int, away_score: int, minute: int) -> bool:
         payload = {
@@ -146,7 +137,7 @@ def forward_commentary(self, commentary: Dict[str, Any]) -> bool:
         return self._post(f"/games/{fixture_id}/events/batch", {"events": events})
 
     # ============================================================
-    # COMMENTARY - FIXED
+    # COMMENTARY
     # ============================================================
 
     def forward_commentary(self, commentary: Dict[str, Any]) -> bool:
@@ -176,7 +167,7 @@ def forward_commentary(self, commentary: Dict[str, Any]) -> bool:
         return self._post("/games/commentary/bulk", payload)
 
     # ============================================================
-    # LINEUPS - WORKING
+    # LINEUPS
     # ============================================================
 
     def forward_lineups(self, lineups: Dict[str, Any]) -> bool:
