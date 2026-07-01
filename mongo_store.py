@@ -270,14 +270,20 @@ class FixtureStore:
             {"$set": update}
         )
 
-    def update_score(self, match_id: str, home_score: int, away_score: int) -> None:
-        """Update score for a match."""
+    def update_score(self, match_id: str, home_score, away_score) -> None:
+        """Update score for a match.
+        Coerces to int explicitly: 365scores' JSON sometimes returns score
+        as a float (e.g. 1.0), which Python's json module happily accepts
+        and pymongo then stores as a BSON double. Rust's Game.home_score /
+        away_score are Option<i32>, so a stored double fails deserialization
+        with 'invalid type: floating point, expected i32' -- this cast is
+        the fix, applied at the write boundary so it can never regress."""
         self._collection.update_one(
             {"matchId": match_id},
             {
                 "$set": {
-                    "homeScore": home_score,
-                    "awayScore": away_score,
+                    "homeScore": int(home_score) if home_score is not None else None,
+                    "awayScore": int(away_score) if away_score is not None else None,
                     "scrapedAt": datetime.now(timezone.utc),
                 }
             }

@@ -547,8 +547,16 @@ class Poller:
             )
 
             if lineups:
-                # Store in MongoDB (raw shape, for our own use)
-                self.store.store_lineups(match_id, lineups)
+                # Do NOT write raw `lineups` into fixtures.lineups here -- that
+                # field is Option<LineupsDocument> on the Rust side, a typed
+                # shape (homeLineup/awayLineup with formation/coach/players/
+                # bench), not this raw 365scores payload (members/statsCategory/
+                # heatMap/etc). Writing it directly corrupts the fixture doc and
+                # breaks deserialization of the ENTIRE Game (not just lineups),
+                # which is what was breaking get_live_games. The Rust
+                # /games/lineups endpoint (via forward_lineups below) builds the
+                # correct shape into a separate `lineups` collection -- that's
+                # the only write path for this data now.
 
                 # Reshape into what the Rust API actually expects before forwarding
                 home_team = match.get("homeTeam", "Home")
@@ -591,7 +599,15 @@ class Poller:
                 "away": stats.get("away", {}),
             }
 
-            self.store.add_statistics_snapshot(match_id, statistics, minute)
+            # Do NOT write `statistics` directly here -- Rust's
+            # StatisticsSnapshot.statistics is a typed MatchStatistics{home,
+            # away: TeamStatistics} with NO #[serde(rename)], meaning it
+            # expects exact snake_case keys (possession, shots_on_target,
+            # etc). Any mismatch with this dict's actual keys silently
+            # produces all-null fields (Option<T> swallows the miss instead
+            # of erroring) rather than real stats data. Forward through the
+            # Rust /games/statistics endpoint only, which maps fields
+            # explicitly via team_stats_from_payload.
 
             # fetch_statistics() returns {"home", "away", "minute"} with no
             # fixture_id -- forward_statistics() needs {"fixture_id",
@@ -629,9 +645,13 @@ class Poller:
         home_comp = game.get("homeCompetitor", {})
         away_comp = game.get("awayCompetitor", {})
 
-        # Update scores
-        home_score = home_comp.get("score")
-        away_score = away_comp.get("score")
+        # Update scores -- cast immediately, 365scores' API is inconsistent
+        # about returning score as int vs float in its JSON, and a float
+        # here ends up as a BSON double that Rust's Option<i32> rejects.
+        raw_home_score = home_comp.get("score")
+        raw_away_score = away_comp.get("score")
+        home_score = int(raw_home_score) if raw_home_score is not None else None
+        away_score = int(raw_away_score) if raw_away_score is not None else None
         if home_score is not None:
             self.store.update_score(match_id, home_score, away_score)
             logger.info(f"📊 {match_id}: Score updated {home_score}-{away_score}")
