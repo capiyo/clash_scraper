@@ -459,7 +459,7 @@ class Poller:
                 # Process live updates (scores, status, completion)
                 self._process_live_updates(match, game_data)
                 
-                # Process commentary from 365Scores (NOT Flashscore)
+                # Process commentary from 365Scores
                 self._process_commentary(match, game_data)
             else:
                 # Fallback: fetch live updates separately if full data fails
@@ -682,7 +682,7 @@ class Poller:
 
                 success = self.forwarder.forward_lineups(payload)
                 if success:
-                    self.store.mark_lineups_fetched(match_id)
+                    # ✅ Don't mark lineups fetched here - Rust API does this
                     logger.info(f"✅ Lineups fetched and forwarded for {match_id}")
                     return True
                 logger.warning(f"⚠️ Failed to forward lineups for {match_id}")
@@ -728,8 +728,8 @@ class Poller:
 
     def _finalize_match_result(self, match: Dict[str, Any]):
         """
-        Finalize match result and notify Rust API.
-        Rust expects only fixture_id and result.
+        Finalize match result - move to history.
+        Uses move_to_history endpoint since /finalize doesn't exist.
         """
         match_id = match.get("matchId")
 
@@ -748,15 +748,11 @@ class Poller:
         else:
             result = "draw"
 
-        finalize_payload = {
-            "fixture_id": match_id,
-            "result": result,
-        }
-
-        success = self.forwarder.finalize_match(finalize_payload)
+        # ✅ Use move_to_history since /games/finalize doesn't exist
+        success = self.forwarder.move_to_history(match_id)
         if success:
             self.state_machine.mark_completed_notified(match_id)
-            logger.info(f"🏁 Match {match_id} finalized: {result} ({home_score}-{away_score})")
+            logger.info(f"🏁 Match {match_id} moved to history: {result} ({home_score}-{away_score})")
 
     def _notify_match_live(self, match: Dict[str, Any]):
         """Send notification that match is now live."""

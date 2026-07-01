@@ -51,6 +51,20 @@ class Forwarder:
                 logger.error(f"Payload: {json.dumps(data, indent=2)[:1000]}")
             return False
 
+    def _put(self, endpoint: str, data: Dict[str, Any]) -> bool:
+        """PUT method for endpoints that require it."""
+        url = f"{self.api_url}{endpoint}"
+        try:
+            response = self.session.put(url, json=data, timeout=self.timeout)
+            response.raise_for_status()
+            logger.info(f"✅ PUT to {endpoint} successful")
+            return True
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to PUT to {endpoint}: {e}")
+            if hasattr(e, 'response') and e.response:
+                logger.error(f"Response: {e.response.text[:500]}")
+            return False
+
     def _get(self, endpoint: str, params: Optional[Dict] = None) -> Optional[Dict]:
         url = f"{self.api_url}{endpoint}"
         try:
@@ -231,23 +245,30 @@ class Forwarder:
         return self._post("/games/lineups", payload)
 
     # ============================================================
-    # FINALIZE MATCH - MATCHES RUST FinalizeFixtureRequest
+    # FINALIZE MATCH - MOVED TO HISTORY
     # ============================================================
 
     def finalize_match(self, finalize_data: Dict[str, Any]) -> bool:
         """
-        Rust expects only fixture_id and result.
+        DEPRECATED: /games/finalize doesn't exist in Rust API.
+        Use move_to_history() instead.
         """
-        payload = self._clean({
-            "fixture_id": finalize_data.get("fixture_id"),
-            "result": finalize_data.get("result"),
-        })
-        
-        if payload.get("fixture_id") is None or payload.get("result") is None:
-            logger.error("Missing fixture_id or result in finalize")
+        logger.warning("finalize_match is deprecated - use move_to_history() instead")
+        fixture_id = finalize_data.get("fixture_id")
+        if not fixture_id:
+            logger.error("Missing fixture_id in finalize")
             return False
-            
-        return self._post("/games/finalize", payload)
+        return self.move_to_history(fixture_id)
+
+    def move_to_history(self, fixture_id: str) -> bool:
+        """
+        Move a completed match to history.
+        POST /games/{fixture_id}/move-to-history
+        """
+        if not fixture_id:
+            logger.error("Missing fixture_id for move_to_history")
+            return False
+        return self._post(f"/games/{fixture_id}/move-to-history", {})
 
     # ============================================================
     # OTHER METHODS
@@ -266,7 +287,7 @@ class Forwarder:
             "awayScore": int(away_score),
             "timeElapsed": int(minute),
         }
-        return self._post(f"/games/{match_id}/score", payload)
+        return self._put(f"/games/{match_id}/score", payload)
 
     def forward_status_update(self, match_id: str, status: str, is_live: bool, available_for_voting: bool) -> bool:
         payload = {
@@ -275,7 +296,7 @@ class Forwarder:
             "isLive": is_live,
             "availableForVoting": available_for_voting,
         }
-        return self._post(f"/games/{match_id}/status", payload)
+        return self._put(f"/games/{match_id}/status", payload)
 
     def forward_event(self, event: Dict[str, Any]) -> bool:
         payload = self._clean({
@@ -315,9 +336,6 @@ class Forwarder:
             "awayScore": int(away_score),
         }
         return self._post("/games/result", payload)
-
-    def move_to_history(self, fixture_id: str) -> bool:
-        return self._post(f"/games/{fixture_id}/move-to-history", {})
 
     def forward_lineups_simplified(self, fixture_id: str, home_players: List[Dict], away_players: List[Dict]) -> bool:
         payload = {
