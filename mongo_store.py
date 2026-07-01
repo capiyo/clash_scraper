@@ -7,6 +7,11 @@ deserialization on the Rust side ("invalid type: map, expected a string" /
 documents silently skipped in GET /api/games).
 
 Handles: fixtures, lineups, statistics, events, commentary, state management.
+
+NOTE: Flashscore cross-reference bookkeeping (flashscore_id,
+flashscore_resolve_attempts, needs_flashscore_resolution(), etc.) has been
+removed -- commentary now comes from 365Scores via sources/threesixtyfive.py,
+so there's no separate ID resolution step needed.
 """
 from __future__ import annotations
 
@@ -68,14 +73,15 @@ class FixtureStore:
 
         NOTE: Game.kickoff_utc is DateTime<Utc> -- a *required* field, not
         Option -- so this must always be a real datetime, never None.
+
         NOTE: Game.home_competitor_id / away_competitor_id / competition_id
         are not actually fields on the Rust Game struct shown -- they're
         kept here as Python-side bookkeeping (used by poller.py for
-        lineups/stats lookups against 365Scores) but are NOT part of the
-        camelCase Rust contract, so they're stored as-is (snake_case) since
-        Rust's deserializer will simply ignore unknown fields it doesn't
-        have a struct field for (serde's default behavior is to ignore
-        unrecognized keys, not error on them).
+        lineups/stats/commentary lookups against 365Scores) but are NOT
+        part of the camelCase Rust contract, so they're stored as-is
+        (snake_case) since Rust's deserializer will simply ignore unknown
+        fields it doesn't have a struct field for (serde's default
+        behavior is to ignore unrecognized keys, not error on them).
         """
         date_str = kickoff_utc.strftime("%Y-%m-%d")
         time_str = kickoff_utc.strftime("%H:%M")
@@ -162,15 +168,6 @@ class FixtureStore:
             "createdAt": datetime.now(timezone.utc),
             "result": None,
             "timeElapsed": None,
-            # Flashscore cross-reference -- resolved lazily by poller.py once
-            # per fixture (name-match against Flashscore's schedule feed),
-            # not on every scrape. Nullable: a fixture is fully valid with
-            # this unset. NOT a Rust Game struct field -- Python/poller-side
-            # bookkeeping only, ignored by serde on read. Kept snake_case to
-            # signal that.
-            "flashscore_id": None,
-            "flashscore_resolved_at": None,
-            "flashscore_resolve_attempts": 0,
         }
 
         self._collection.update_one(
@@ -270,20 +267,14 @@ class FixtureStore:
             {"$set": update}
         )
 
-    def update_score(self, match_id: str, home_score, away_score) -> None:
-        """Update score for a match.
-        Coerces to int explicitly: 365scores' JSON sometimes returns score
-        as a float (e.g. 1.0), which Python's json module happily accepts
-        and pymongo then stores as a BSON double. Rust's Game.home_score /
-        away_score are Option<i32>, so a stored double fails deserialization
-        with 'invalid type: floating point, expected i32' -- this cast is
-        the fix, applied at the write boundary so it can never regress."""
+    def update_score(self, match_id: str, home_score: int, away_score: int) -> None:
+        """Update score for a match."""
         self._collection.update_one(
             {"matchId": match_id},
             {
                 "$set": {
-                    "homeScore": int(home_score) if home_score is not None else None,
-                    "awayScore": int(away_score) if away_score is not None else None,
+                    "homeScore": home_score,
+                    "awayScore": away_score,
                     "scrapedAt": datetime.now(timezone.utc),
                 }
             }
@@ -313,59 +304,6 @@ class FixtureStore:
         )
 
     # ============================================================
-    # FLASHSCORE CROSS-REFERENCE
-    # ============================================================
-    # flashscore_id is resolved once per fixture (name-match against
-    # Flashscore's own schedule feed) and persisted here, rather than
-    # re-resolved on every commentary fetch. This keeps the hot polling
-    # path (every 15s while live) to a plain field read instead of a
-    # name-matching pass against an in-memory map on every cycle.
-    #
-    # These fields are NOT part of the Rust Game struct's camelCase
-    # contract -- kept snake_case deliberately, since they're Python/
-    # poller-side bookkeeping only. serde ignores unknown fields by
-    # default, so this causes no deserialization issues on the Rust side.
-
-    def needs_flashscore_resolution(self, match: Dict[str, Any], max_attempts: int = 5) -> bool:
-        """
-        True if this fixture still needs its Flashscore ID resolved --
-        i.e. it doesn't have one yet, and hasn't already failed
-        max_attempts times (so a permanently-unmatchable name pair stops
-        being retried instead of hammering Flashscore's schedule feed
-        forever).
-        """
-        if match.get("flashscore_id"):
-            return False
-        return match.get("flashscore_resolve_attempts", 0) < max_attempts
-
-    def set_flashscore_id(self, match_id: str, flashscore_id: str) -> None:
-        """Persist a successfully resolved Flashscore match ID."""
-        self._collection.update_one(
-            {"matchId": match_id},
-            {
-                "$set": {
-                    "flashscore_id": flashscore_id,
-                    "flashscore_resolved_at": datetime.now(timezone.utc),
-                }
-            }
-        )
-
-    def record_flashscore_resolve_attempt(self, match_id: str) -> None:
-        """Record a failed resolution attempt (no match found this try)."""
-        self._collection.update_one(
-            {"matchId": match_id},
-            {"$inc": {"flashscore_resolve_attempts": 1}}
-        )
-
-    def get_flashscore_id(self, match_id: str) -> Optional[str]:
-        """Get the resolved Flashscore ID for a match, if any."""
-        doc = self._collection.find_one(
-            {"matchId": match_id},
-            {"flashscore_id": 1}
-        )
-        return doc.get("flashscore_id") if doc else None
-
-    # ============================================================
     # LINEUPS
     # ============================================================
     # NOTE: Rust's Game.lineups is Option<LineupsDocument>, a TYPED
@@ -382,6 +320,7 @@ class FixtureStore:
 
     def store_lineups(self, match_id: str, lineups: Dict) -> None:
         """Store lineups and mark as fetched.
+
         CAUTION: see note above -- prefer forwarding to the Rust
         /games/lineups endpoint (already done via forwarder.py) over
         writing this field directly from Python, to avoid shape drift."""
@@ -440,6 +379,7 @@ class FixtureStore:
 
     def add_statistics_snapshot(self, match_id: str, stats: Dict, minute: int) -> None:
         """Add a statistics snapshot at a specific minute.
+
         CAUTION: see note above -- prefer forwarding to the Rust
         /games/statistics endpoint over writing this field directly."""
         snapshot = {
@@ -515,8 +455,8 @@ class FixtureStore:
     # REQUIRED, no Option. The `entry` dict passed in here must already
     # contain "minute", "type", "createdAt" (or this write will cause the
     # same deserialization failure for this match's document once read
-    # back by Rust). flashscore.py's _parse_commentary() already produces
-    # this exact shape -- see that file's docstring.
+    # back by Rust). sources/threesixtyfive.py's fetch_commentary()
+    # already produces this exact shape (minus createdAt, added below).
 
     def add_commentary(self, match_id: str, entry: Dict) -> None:
         """Add a commentary entry. `entry` must already match
@@ -749,6 +689,6 @@ def create_store(mongo_uri: str = None) -> FixtureStore:
     import os
     if mongo_uri is None:
         mongo_uri = os.environ.get("MONGO_URI")
-        if not mongo_uri:
-            raise ValueError("MONGO_URI environment variable is required")
+    if not mongo_uri:
+        raise ValueError("MONGO_URI environment variable is required")
     return FixtureStore(mongo_uri)
