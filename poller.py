@@ -531,23 +531,39 @@ class Poller:
         home_score = home_comp.get("score")
         away_score = away_comp.get("score")
 
-        if home_score is not None:
+        # 365Scores uses -1 as a sentinel for "no score yet" (pre-match),
+        # not None. Treating -1 as a real score writes garbage into Mongo
+        # and logs a fake "score updated" event for matches that haven't
+        # actually started scoring yet.
+        has_real_score = (
+            home_score is not None
+            and away_score is not None
+            and home_score >= 0
+            and away_score >= 0
+        )
+
+        if has_real_score:
             self.store.update_score(match_id, home_score, away_score)
             logger.info(f"📊 {match_id}: Score updated {home_score}-{away_score}")
+        else:
+            logger.debug(
+                f"{match_id}: Ignoring placeholder score "
+                f"({home_score}-{away_score}), match hasn't started scoring yet"
+            )
 
         # Check if match ended
-        status_text = game.get("statusText", "").lower()
-        if status_text in ("finished", "ft", "ended", "full-time"):
+        status_text = (game.get("statusText") or "").strip().lower()
+        if status_text in ("finished", "ft", "ended", "full-time", "aet", "pen"):
             self.store.update_status(match_id, "completed")
             self._finalize_match_result(match)
             return
 
-        # Forward live update
+        # Forward live update -- only send real scores downstream, never -1
         live_update = {
             "fixture_id": match_id,
             "event_type": "live_update",
-            "home_score": home_score or 0,
-            "away_score": away_score or 0,
+            "home_score": home_score if has_real_score else 0,
+            "away_score": away_score if has_real_score else 0,
             "minute": game.get("gameTime", 0),
             "status": "live",
         }
@@ -562,8 +578,8 @@ class Poller:
             logger.warning(f"{match_id}: Cannot finalize - match not found")
             return
 
-        home_score = game.get("home_score", 0)
-        away_score = game.get("away_score", 0)
+        home_score = game.get("homeScore", 0)
+        away_score = game.get("awayScore", 0)
 
         if home_score > away_score:
             result = "home"

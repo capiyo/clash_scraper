@@ -1,3 +1,4 @@
+
 """
 MongoDB access for the poller. Field names match the Rust Game struct
 EXACTLY (camelCase, per each #[serde(rename = "...")]) -- this was
@@ -71,17 +72,16 @@ class FixtureStore:
         (see models/game.rs): matchId, homeTeam, awayTeam, kickoffUtc,
         isLive, availableForVoting, homeWin/awayWin, scrapedAt, etc.
 
-        NOTE: Game.kickoff_utc is DateTime<Utc> -- a *required* field, not
-        Option -- so this must always be a real datetime, never None.
-
-        NOTE: Game.home_competitor_id / away_competitor_id / competition_id
-        are not actually fields on the Rust Game struct shown -- they're
-        kept here as Python-side bookkeeping (used by poller.py for
-        lineups/stats/commentary lookups against 365Scores) but are NOT
-        part of the camelCase Rust contract, so they're stored as-is
-        (snake_case) since Rust's deserializer will simply ignore unknown
-        fields it doesn't have a struct field for (serde's default
-        behavior is to ignore unrecognized keys, not error on them).
+        NOTE: status / isLive / availableForVoting are ONLY written on
+        INSERT (via $setOnInsert below), never on update. poller.py's
+        MatchStateMachine is the sole owner of those three fields for the
+        lifetime of a fixture -- scraper.py re-runs periodically just to
+        pick up new fixtures, and previously re-upserting an EXISTING
+        fixture would stomp poller.py's correct "soon"/"live" state back
+        to whatever scraper.py's own (cruder, statusText-based) guess was,
+        causing fixtures to flip back to "live" while still an hour from
+        kickoff. `status` is still accepted as a param here because it's
+        needed for the initial insert.
         """
         date_str = kickoff_utc.strftime("%Y-%m-%d")
         time_str = kickoff_utc.strftime("%H:%M")
@@ -96,10 +96,9 @@ class FixtureStore:
             away_win = odds.get("awayWin", 1.0)
             draw = odds.get("draw", 1.0)
 
-        is_live = status == "live"
-        available_for_voting = status in ("upcoming", "soon")
-
         # Build the document -- camelCase keys matching Game's #[serde(rename)]
+        # status/isLive/availableForVoting deliberately NOT here anymore --
+        # moved to set_on_insert below.
         doc = {
             "matchId": match_id,
             "threesixtyfiveGameId": threesixtyfive_game_id,
@@ -124,11 +123,6 @@ class FixtureStore:
             # object (which pymongo would otherwise encode as a native
             # BSON Date and fail deserialization on the Rust side).
             "kickoffUtc": kickoff_utc.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "homeScore": None,
-            "awayScore": None,
-            "status": status,
-            "isLive": is_live,
-            "availableForVoting": available_for_voting,
             "homeWin": home_win,
             "awayWin": away_win,
             "draw": draw,
@@ -137,7 +131,13 @@ class FixtureStore:
             "lastScrapedAt": datetime.now(timezone.utc),
         }
 
-        # Fields that should ONLY be set on insert (user-generated data preserved)
+        # Fields that should ONLY be set on insert (user-generated data
+        # preserved, and now also status/isLive/availableForVoting/scores --
+        # once a fixture exists, only poller.py's state machine and
+        # update_score()/update_status() are allowed to change these).
+        is_live = status == "live"
+        available_for_voting = status in ("upcoming", "soon")
+
         set_on_insert = {
             # CRITICAL: explicitly set _id to the same string as matchId.
             # Without this, MongoDB auto-generates _id as a BSON ObjectId.
@@ -150,6 +150,11 @@ class FixtureStore:
             # after every other field was correctly renamed to camelCase --
             # the camelCase fix was necessary but not sufficient.
             "_id": match_id,
+            "status": status,
+            "isLive": is_live,
+            "availableForVoting": available_for_voting,
+            "homeScore": None,
+            "awayScore": None,
             "votes": 0,
             "voters": [],
             "comments": 0,

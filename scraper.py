@@ -31,11 +31,12 @@ SCRAPE_DAYS_AHEAD = 7
 
 def _status_to_internal(status_text: str) -> str:
     text = (status_text or "").strip().lower()
-    if text in ("finished", "ft", "ended", "full-time"):
+    if text in ("finished", "ft", "ended", "full-time", "aet", "pen"):
         return "completed"
-    if text in ("", "scheduled", "not started"):
-        return "upcoming"
-    return "live"
+    live_markers = ("live", "1st half", "2nd half", "ht", "halftime", "in progress")
+    if any(m in text for m in live_markers):
+        return "live"
+    return "upcoming"  # safe default
 
 
 def _parse_kickoff(start_time_raw: str | None) -> datetime.datetime:
