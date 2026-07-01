@@ -223,17 +223,18 @@ class Forwarder:
         return self._post("/games/commentary/bulk", payload)
 
     # ============================================================
-    # LINEUPS
+    # LINEUPS - FIXED for Rust API
     # ============================================================
 
     def forward_lineups(self, lineups: Dict[str, Any]) -> bool:
         """
         Forward lineups to the Rust API.
-        Expected payload:
+        
+        The Rust API expects:
         {
-            "fixture_id": "wc26_123",
-            "home_team": "Team A",
-            "away_team": "Team B",
+            "fixtureId": "wc26_123",
+            "homeTeam": "Team A",
+            "awayTeam": "Team B",
             "lineups": {
                 "home": {
                     "formation": "4-3-3",
@@ -242,10 +243,10 @@ class Forwarder:
                         {
                             "name": "Player",
                             "position": "GK",
-                            "jersey_number": 1,
+                            "jerseyNumber": 1,
                             "captain": false,
-                            "lineup": "starting|bench",
-                            "player_id": "123"
+                            "lineup": "starting",
+                            "playerId": "123"
                         }
                     ],
                     "bench": [...]
@@ -254,7 +255,40 @@ class Forwarder:
             }
         }
         """
-        return self._post("/games/lineups", lineups)
+        # Convert from snake_case to camelCase for Rust API
+        payload = {
+            "fixtureId": lineups.get("fixture_id"),
+            "homeTeam": lineups.get("home_team"),
+            "awayTeam": lineups.get("away_team"),
+            "lineups": {
+                "home": self._convert_lineup_side(lineups.get("lineups", {}).get("home", {})),
+                "away": self._convert_lineup_side(lineups.get("lineups", {}).get("away", {}))
+            }
+        }
+        return self._post("/games/lineups", payload)
+    
+    def _convert_lineup_side(self, side: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert a lineup side from snake_case to camelCase for Rust API."""
+        return {
+            "formation": side.get("formation", "4-4-2"),
+            "coach": {"name": side.get("coach", {}).get("name", "Unknown")},
+            "players": self._convert_players(side.get("players", [])),
+            "bench": self._convert_players(side.get("bench", []))
+        }
+    
+    def _convert_players(self, players: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Convert player fields from snake_case to camelCase."""
+        converted = []
+        for player in players:
+            converted.append({
+                "name": player.get("name", "Unknown"),
+                "position": player.get("position", "Unknown"),
+                "jerseyNumber": player.get("jerseyNumber", 0),
+                "captain": player.get("captain", False),
+                "lineup": player.get("lineup", "starting"),
+                "playerId": player.get("playerId")
+            })
+        return converted
 
     def forward_lineups_simplified(self, fixture_id: str, home_players: List[Dict], away_players: List[Dict]) -> bool:
         """
@@ -268,18 +302,20 @@ class Forwarder:
         return self._post("/games/lineups/simplified", payload)
 
     # ============================================================
-    # STATISTICS
+    # STATISTICS - FIXED for Rust API
     # ============================================================
 
     def forward_statistics(self, statistics: Dict[str, Any]) -> bool:
         """
         Forward match statistics to the Rust API.
-        Expected payload:
+        
+        The Rust API expects:
         {
             "fixture_id": "wc26_123",
+            "minute": 67,
             "statistics": {
                 "home": {
-                    "possession": 55,
+                    "possession": 55.0,
                     "shots": 12,
                     "shots_on_target": 5,
                     "shots_off_target": 4,
@@ -289,19 +325,42 @@ class Forwarder:
                     "red_cards": 0,
                     "offsides": 1,
                     "passes": 450,
-                    "pass_accuracy": 78,
+                    "pass_accuracy": 78.0,
                 },
                 "away": {
-                    "possession": 45,
+                    "possession": 45.0,
                     "shots": 8,
-                    "shots_on_target": 3,
                     ...
                 }
-            },
-            "minute": 67
+            }
         }
         """
-        return self._post("/games/statistics", statistics)
+        # Convert to camelCase for Rust API
+        payload = {
+            "fixture_id": statistics.get("fixture_id"),
+            "minute": statistics.get("minute", 0),
+            "statistics": {
+                "home": self._convert_statistics_side(statistics.get("statistics", {}).get("home", {})),
+                "away": self._convert_statistics_side(statistics.get("statistics", {}).get("away", {}))
+            }
+        }
+        return self._post("/games/statistics", payload)
+    
+    def _convert_statistics_side(self, side: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert statistics from snake_case to camelCase for Rust API."""
+        return {
+            "possession": side.get("possession"),
+            "shots": side.get("shots"),
+            "shotsOnTarget": side.get("shots_on_target"),
+            "shotsOffTarget": side.get("shots_off_target"),
+            "corners": side.get("corners"),
+            "fouls": side.get("fouls"),
+            "yellowCards": side.get("yellow_cards"),
+            "redCards": side.get("red_cards"),
+            "offsides": side.get("offsides"),
+            "passes": side.get("passes"),
+            "passAccuracy": side.get("pass_accuracy"),
+        }
 
     def forward_statistics_bulk(self, stats_bulk: Dict[str, Any]) -> bool:
         """
@@ -321,7 +380,23 @@ class Forwarder:
             ]
         }
         """
-        return self._post("/games/statistics/bulk", stats_bulk)
+        # Convert all snapshots
+        snapshots = stats_bulk.get("snapshots", [])
+        converted_snapshots = []
+        for snapshot in snapshots:
+            converted_snapshots.append({
+                "minute": snapshot.get("minute", 0),
+                "statistics": {
+                    "home": self._convert_statistics_side(snapshot.get("statistics", {}).get("home", {})),
+                    "away": self._convert_statistics_side(snapshot.get("statistics", {}).get("away", {}))
+                }
+            })
+        
+        payload = {
+            "fixture_id": stats_bulk.get("fixture_id"),
+            "snapshots": converted_snapshots
+        }
+        return self._post("/games/statistics/bulk", payload)
 
     def forward_statistics_snapshot(self, fixture_id: str, minute: int, stats: Dict[str, Any]) -> bool:
         """
@@ -330,7 +405,10 @@ class Forwarder:
         payload = {
             "fixture_id": fixture_id,
             "minute": minute,
-            "statistics": stats,
+            "statistics": {
+                "home": self._convert_statistics_side(stats.get("home", {})),
+                "away": self._convert_statistics_side(stats.get("away", {}))
+            }
         }
         return self._post("/games/statistics/snapshot", payload)
 

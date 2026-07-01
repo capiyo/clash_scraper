@@ -1,13 +1,33 @@
 services:
+  # API Server - Handles incoming requests
   - type: web
-    name: clash-scraper
-    env: python
+    name: clash-api
+    runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python server.py
     envVars:
+      - key: PYTHONUNBUFFERED
+        value: "true"
       - key: MONGO_URI
         sync: false
-      - key: FANCLASH_API
-        value: https://clash-api-m5mr.onrender.com/api
-      - key: PYTHON_VERSION
-        value: 3.11.0
+      - key: THREESIXTYFIVE_API_KEY
+        sync: false
+    numInstances: 1
+    healthCheckPath: /health
+
+  # Poller Worker - Fetches and forwards data
+  - type: worker
+    name: clash-poller
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python poller.py
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "true"
+      - key: MONGO_URI
+        sync: false
+      - key: THREESIXTYFIVE_API_KEY
+        sync: false
+      - key: API_BASE_URL
+        value: "https://clash-api-m5mr.onrender.com"
+    numInstances: 1  # CRITICAL: Only one poller instance

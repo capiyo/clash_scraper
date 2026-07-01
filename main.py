@@ -1,61 +1,68 @@
+#!/usr/bin/env python3
 """
-Main entry point for World Cup poller.
-Can run as scraper (once) or poller (continuous).
+Main entry point for the clash_scraper application.
+Runs both the poller and server in a single process (non-forking).
 """
-from __future__ import annotations
 
-import argparse
-import logging
-import os
 import sys
-from dotenv import load_dotenv
+import time
+import threading
+import signal
+import logging
 
-load_dotenv()
+# Import your modules
+import poller
+import server
 
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger("worldcup_poller.main")
+logger = logging.getLogger(__name__)
 
+# Global flag for graceful shutdown
+running = True
 
-def main():
-    parser = argparse.ArgumentParser(description="World Cup Poller")
-    parser.add_argument(
-        "--mode",
-        choices=["scrape", "poll", "both"],
-        default="scrape",
-        help="Run mode: scrape (fetch fixtures once), poll (continuous live updates), both"
-    )
-    parser.add_argument(
-        "--once",
-        action="store_true",
-        help="Run once then exit (for cron jobs)"
-    )
-    args = parser.parse_args()
+def signal_handler(sig, frame):
+    """Handle shutdown signals gracefully"""
+    global running
+    logger.info("Received shutdown signal, exiting...")
+    running = False
 
-    # Validate environment
-    mongo_uri = os.environ.get("MONGO_URI")
-    if not mongo_uri:
-        logger.error("MONGO_URI environment variable is required")
-        sys.exit(1)
+def run_poller():
+    """Run the poller in a thread"""
+    try:
+        poller.main()
+    except Exception as e:
+        logger.error(f"Poller crashed: {e}")
+        global running
+        running = False
 
-    if args.mode == "scrape":
-        from scraper import main as scrape_main
-        scrape_main()
-    elif args.mode == "poll":
-        from poller import main as poll_main
-        poll_main()
-    else:
-        # Run both: scrape then poll
-        from scraper import main as scrape_main
-        from poller import main as poll_main
-        
-        logger.info("Running scrape first...")
-        scrape_main()
-        logger.info("Scrape complete. Starting poller...")
-        poll_main()
-
+def run_server():
+    """Run the server in a thread"""
+    try:
+        server.start()
+    except Exception as e:
+        logger.error(f"Server crashed: {e}")
+        global running
+        running = False
 
 if __name__ == "__main__":
-    main()
+    # Set up signal handlers
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    logger.info("Starting clash_scraper...")
+    
+    # Start poller in a daemon thread (not a separate process)
+    poller_thread = threading.Thread(target=run_poller, daemon=True)
+    poller_thread.start()
+    logger.info("✅ Poller thread started")
+    
+    # Run server in the main thread
+    logger.info("✅ Starting server...")
+    run_server()
+    
+    # Graceful shutdown
+    logger.info("Application exiting")

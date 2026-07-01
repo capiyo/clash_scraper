@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Live poller for World Cup matches with full state machine.
 Handles: upcoming → soon → live → completed → archived
@@ -55,12 +56,12 @@ def _split_lineup_members(lineup: Dict[str, Any]) -> Dict[str, Any]:
             (m.get("position") or {}).get("shortName")
 
         entry = {
-            "player_id": str(m["id"]) if m.get("id") is not None else None,
-            "name": m.get("name"),
-            "position": position,
-            "jersey_number": None,  # not provided by 365Scores
+            "name": m.get("name", "Unknown"),
+            "position": position or "Unknown",
+            "jerseyNumber": None,  # not provided by 365Scores
             "captain": False,       # not provided by 365Scores
             "lineup": "starting" if status == 1 else "bench",
+            "playerId": str(m["id"]) if m.get("id") is not None else None,
         }
 
         if status == 1:
@@ -69,8 +70,8 @@ def _split_lineup_members(lineup: Dict[str, Any]) -> Dict[str, Any]:
             bench.append(entry)
 
     return {
-        "formation": lineup.get("formation"),
-        "coach": coach,
+        "formation": lineup.get("formation", "4-4-2"),
+        "coach": coach or {"name": "Unknown"},
         "players": players,
         "bench": bench,
     }
@@ -564,17 +565,6 @@ class Poller:
             )
 
             if lineups:
-                # Do NOT write raw `lineups` into fixtures.lineups here -- that
-                # field is Option<LineupsDocument> on the Rust side, a typed
-                # shape (homeLineup/awayLineup with formation/coach/players/
-                # bench), not this raw 365scores payload (members/statsCategory/
-                # heatMap/etc). Writing it directly corrupts the fixture doc and
-                # breaks deserialization of the ENTIRE Game (not just lineups),
-                # which is what was breaking get_live_games. The Rust
-                # /games/lineups endpoint (via forward_lineups below) builds the
-                # correct shape into a separate `lineups` collection -- that's
-                # the only write path for this data now.
-
                 # Reshape into what the Rust API actually expects before forwarding
                 home_team = match.get("homeTeam", "Home")
                 away_team = match.get("awayTeam", "Away")
@@ -618,19 +608,6 @@ class Poller:
                 "away": stats.get("away", {}),
             }
 
-            # Do NOT write `statistics` directly here -- Rust's
-            # StatisticsSnapshot.statistics is a typed MatchStatistics{home,
-            # away: TeamStatistics} with NO #[serde(rename)], meaning it
-            # expects exact snake_case keys (possession, shots_on_target,
-            # etc). Any mismatch with this dict's actual keys silently
-            # produces all-null fields (Option<T> swallows the miss instead
-            # of erroring) rather than real stats data. Forward through the
-            # Rust /games/statistics endpoint only, which maps fields
-            # explicitly via team_stats_from_payload.
-
-            # fetch_statistics() returns {"home", "away", "minute"} with no
-            # fixture_id -- forward_statistics() needs {"fixture_id",
-            # "statistics": {"home", "away"}, "minute"}.
             payload = {
                 "fixture_id": match_id,
                 "statistics": statistics,
