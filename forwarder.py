@@ -223,39 +223,14 @@ class Forwarder:
         return self._post("/games/commentary/bulk", payload)
 
     # ============================================================
-    # LINEUPS - FIXED for Rust API
+    # LINEUPS - FIXED
     # ============================================================
 
     def forward_lineups(self, lineups: Dict[str, Any]) -> bool:
         """
         Forward lineups to the Rust API.
-        
-        The Rust API expects:
-        {
-            "fixtureId": "wc26_123",
-            "homeTeam": "Team A",
-            "awayTeam": "Team B",
-            "lineups": {
-                "home": {
-                    "formation": "4-3-3",
-                    "coach": {"name": "Coach Name"},
-                    "players": [
-                        {
-                            "name": "Player",
-                            "position": "GK",
-                            "jerseyNumber": 1,
-                            "captain": false,
-                            "lineup": "starting",
-                            "playerId": "123"
-                        }
-                    ],
-                    "bench": [...]
-                },
-                "away": {...}
-            }
-        }
         """
-        # Convert from snake_case to camelCase for Rust API
+        # Convert to exact Rust API format
         payload = {
             "fixtureId": lineups.get("fixture_id"),
             "homeTeam": lineups.get("home_team"),
@@ -268,7 +243,7 @@ class Forwarder:
         return self._post("/games/lineups", payload)
     
     def _convert_lineup_side(self, side: Dict[str, Any]) -> Dict[str, Any]:
-        """Convert a lineup side from snake_case to camelCase for Rust API."""
+        """Convert lineup side to Rust API format."""
         return {
             "formation": side.get("formation", "4-4-2"),
             "coach": {"name": side.get("coach", {}).get("name", "Unknown")},
@@ -277,18 +252,15 @@ class Forwarder:
         }
     
     def _convert_players(self, players: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Convert player fields from snake_case to camelCase."""
-        converted = []
-        for player in players:
-            converted.append({
-                "name": player.get("name", "Unknown"),
-                "position": player.get("position", "Unknown"),
-                "jerseyNumber": player.get("jerseyNumber", 0),
-                "captain": player.get("captain", False),
-                "lineup": player.get("lineup", "starting"),
-                "playerId": player.get("playerId")
-            })
-        return converted
+        """Convert players to Rust API format."""
+        return [{
+            "name": p.get("name", "Unknown"),
+            "position": p.get("position", "Unknown"),
+            "jerseyNumber": p.get("jerseyNumber", 0),
+            "captain": p.get("captain", False),
+            "lineup": p.get("lineup", "starting"),
+            "playerId": p.get("playerId")
+        } for p in players]
 
     def forward_lineups_simplified(self, fixture_id: str, home_players: List[Dict], away_players: List[Dict]) -> bool:
         """
@@ -302,40 +274,13 @@ class Forwarder:
         return self._post("/games/lineups/simplified", payload)
 
     # ============================================================
-    # STATISTICS - FIXED for Rust API
+    # STATISTICS - FIXED
     # ============================================================
 
     def forward_statistics(self, statistics: Dict[str, Any]) -> bool:
         """
         Forward match statistics to the Rust API.
-        
-        The Rust API expects:
-        {
-            "fixture_id": "wc26_123",
-            "minute": 67,
-            "statistics": {
-                "home": {
-                    "possession": 55.0,
-                    "shots": 12,
-                    "shots_on_target": 5,
-                    "shots_off_target": 4,
-                    "corners": 6,
-                    "fouls": 10,
-                    "yellow_cards": 2,
-                    "red_cards": 0,
-                    "offsides": 1,
-                    "passes": 450,
-                    "pass_accuracy": 78.0,
-                },
-                "away": {
-                    "possession": 45.0,
-                    "shots": 8,
-                    ...
-                }
-            }
-        }
         """
-        # Convert to camelCase for Rust API
         payload = {
             "fixture_id": statistics.get("fixture_id"),
             "minute": statistics.get("minute", 0),
@@ -347,40 +292,25 @@ class Forwarder:
         return self._post("/games/statistics", payload)
     
     def _convert_statistics_side(self, side: Dict[str, Any]) -> Dict[str, Any]:
-        """Convert statistics from snake_case to camelCase for Rust API."""
+        """Convert statistics to Rust API format."""
         return {
             "possession": side.get("possession"),
             "shots": side.get("shots"),
-            "shotsOnTarget": side.get("shots_on_target"),
-            "shotsOffTarget": side.get("shots_off_target"),
+            "shots_on_target": side.get("shots_on_target"),
+            "shots_off_target": side.get("shots_off_target"),
             "corners": side.get("corners"),
             "fouls": side.get("fouls"),
-            "yellowCards": side.get("yellow_cards"),
-            "redCards": side.get("red_cards"),
+            "yellow_cards": side.get("yellow_cards"),
+            "red_cards": side.get("red_cards"),
             "offsides": side.get("offsides"),
             "passes": side.get("passes"),
-            "passAccuracy": side.get("pass_accuracy"),
+            "pass_accuracy": side.get("pass_accuracy")
         }
 
     def forward_statistics_bulk(self, stats_bulk: Dict[str, Any]) -> bool:
         """
         Forward multiple statistics snapshots at once.
-        Expected payload:
-        {
-            "fixture_id": "wc26_123",
-            "snapshots": [
-                {
-                    "minute": 15,
-                    "statistics": {...}
-                },
-                {
-                    "minute": 30,
-                    "statistics": {...}
-                }
-            ]
-        }
         """
-        # Convert all snapshots
         snapshots = stats_bulk.get("snapshots", [])
         converted_snapshots = []
         for snapshot in snapshots:
@@ -419,15 +349,6 @@ class Forwarder:
     def finalize_match(self, finalize_data: Dict[str, Any]) -> bool:
         """
         Finalize match result.
-        Expected payload:
-        {
-            "fixture_id": "wc26_123",
-            "result": "home|away|draw",
-            "home_score": 2,
-            "away_score": 1,
-            "winner": "home_team|away_team|none",
-            "status": "completed",
-        }
         """
         return self._post("/games/finalize", finalize_data)
 
@@ -456,18 +377,6 @@ class Forwarder:
     def forward_notification(self, notification: Dict[str, Any]) -> bool:
         """
         Forward a notification to the Rust API.
-        Expected payload:
-        {
-            "fixture_id": "wc26_123",
-            "event_type": "match_live|lineups_available|goal_scored|match_ended",
-            "title": "⚽ Match is LIVE!",
-            "body": "Team A vs Team B is now live!",
-            "data": {
-                "home_team": "Team A",
-                "away_team": "Team B",
-                "score": "1-0"
-            }
-        }
         """
         return self._post("/games/notify", notification)
 
@@ -583,20 +492,6 @@ class Forwarder:
     def sync_live_data(self, live_data: Dict[str, Any]) -> bool:
         """
         Sync live data for multiple matches at once.
-        Expected payload:
-        {
-            "timestamp": "2026-06-27T15:00:00Z",
-            "matches": [
-                {
-                    "fixture_id": "wc26_123",
-                    "home_score": 1,
-                    "away_score": 0,
-                    "status": "live",
-                    "events": [...],
-                    "statistics": {...}
-                }
-            ]
-        }
         """
         return self._post("/games/sync/live", live_data)
 
