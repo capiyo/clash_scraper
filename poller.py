@@ -83,7 +83,6 @@ def _split_lineup_members(lineup: Dict[str, Any]) -> Dict[str, Any]:
             players.append(entry)
         elif status == 2:
             bench.append(entry)
-        # status == 4 (coach) already handled above
 
     return {
         "formation": lineup.get("formation", "4-4-2"),
@@ -114,27 +113,23 @@ def _build_lineups_payload(
 
 
 # Polling intervals (in seconds)
-POLL_INTERVAL_LIVE = 15  # Every 15 seconds for live matches
-POLL_INTERVAL_SOON = 60  # Every minute for soon matches
-POLL_INTERVAL_UPCOMING = 300  # Every 5 minutes for upcoming matches
+POLL_INTERVAL_LIVE = 15
+POLL_INTERVAL_SOON = 60
+POLL_INTERVAL_UPCOMING = 300
 
 # Time thresholds (in minutes before kickoff)
-SOON_THRESHOLD_MINUTES = 60  # 1 hour before kickoff = "soon"
-LINEUP_EARLY_THRESHOLD = 60  # Start checking at 60 mins before
-LINEUP_LATE_THRESHOLD = 40  # Stop checking at 40 mins before
-STATS_THRESHOLD_MINUTES = 10  # 10 minutes before kickoff = start stats
+SOON_THRESHOLD_MINUTES = 60
+LINEUP_EARLY_THRESHOLD = 60
+LINEUP_LATE_THRESHOLD = 40
+STATS_THRESHOLD_MINUTES = 10
 
 # Flashscore name->ID resolution: rebuild the in-memory schedule map at
-# most this often. Resolution only runs for fixtures missing flashscore_id,
-# so this just bounds how stale the map can get during a long-running process.
+# most this often.
 FLASHSCORE_MAP_TTL_SECONDS = 6 * 3600
 FLASHSCORE_MAX_RESOLVE_ATTEMPTS = 5
 
-# How often to check for completed fixtures that are ready to be archived
-# (movedToHistory=True). Archiving itself only touches fixtures whose
-# completedAt is older than ARCHIVE_AFTER_HOURS -- this just bounds how
-# often we run that query, since it doesn't need to run every 5s poll tick.
-ARCHIVE_CHECK_INTERVAL_SECONDS = 3600  # once an hour
+# Archive check interval
+ARCHIVE_CHECK_INTERVAL_SECONDS = 3600
 ARCHIVE_AFTER_HOURS = 24
 
 
@@ -213,11 +208,6 @@ class MatchStateMachine:
         """
         match_id = match.get("matchId")
 
-        # Trust the persisted DB flag over the in-memory set: multiple
-        # poller processes/instances each have their own empty
-        # lineups_fetched set on boot, so relying on memory alone lets
-        # instances disagree. The DB flag is only set on a real,
-        # successfully-forwarded fetch (see _fetch_and_forward_lineups).
         if match.get("lineupsFetched"):
             self.lineups_fetched.add(match_id)
             return False
@@ -330,10 +320,6 @@ class Poller:
         self.running = False
         self.poll_count = 0
 
-        # Flashscore schedule map -- used ONLY by _resolve_flashscore_id().
-        # Built lazily on first need, rebuilt every FLASHSCORE_MAP_TTL
-        # seconds. NOT used by the commentary hot path, which reads the
-        # already-persisted flashscore_id straight from the fixture doc.
         self._flashscore_map: Dict[tuple, str] = {}
         self._flashscore_map_built_at: float = 0.0
         self._last_archive_check: float = 0.0
@@ -368,13 +354,7 @@ class Poller:
         self._maybe_archive_completed()
 
     def _maybe_archive_completed(self):
-        """
-        Flip movedToHistory=True on completed fixtures older than
-        ARCHIVE_AFTER_HOURS. Throttled to ARCHIVE_CHECK_INTERVAL_SECONDS
-        since this doesn't need to run on every 5s poll tick -- it was
-        previously never called at all, which is why movedToHistory sat
-        at False forever even for long-finished matches.
-        """
+        """Flip movedToHistory=True on completed fixtures older than ARCHIVE_AFTER_HOURS."""
         now = time.time()
         if now - self._last_archive_check < ARCHIVE_CHECK_INTERVAL_SECONDS:
             return
@@ -432,7 +412,9 @@ class Poller:
                     "status": new_status,
                     "is_live": new_status == "live",
                     "available_for_voting": new_status in ["upcoming", "soon"],
-                    "minutes_to_kickoff": minutes_to_kickoff,
+                    "minute": 0,
+                    "home_score": match.get("homeScore") or match.get("home_score", 0),
+                    "away_score": match.get("awayScore") or match.get("away_score", 0),
                 }
             )
 
@@ -460,36 +442,25 @@ class Poller:
         if current_status == "live":
             self._fetch_live_updates(match)
 
-            # --- STEP 5: RESOLVE FLASHSCORE ID (once per fixture) THEN
-            #             FETCH COMMENTARY (every cycle) ---
             if self.store.needs_flashscore_resolution(match, FLASHSCORE_MAX_RESOLVE_ATTEMPTS):
                 self._resolve_flashscore_id(match)
             self._fetch_commentary(match)
 
-        # --- STEP 6: CHECK COMPLETION ---
+        # --- STEP 5: CHECK COMPLETION ---
         if self.state_machine.should_finalize_result(match):
             self._finalize_match_result(match)
 
         self.store.record_last_poll(match_id)
 
     def _ensure_flashscore_map(self):
-        """Build or refresh the in-memory Flashscore schedule map, used
-        only by _resolve_flashscore_id(). Does not touch MongoDB."""
+        """Build or refresh the in-memory Flashscore schedule map."""
         age = time.time() - self._flashscore_map_built_at
         if not self._flashscore_map or age > FLASHSCORE_MAP_TTL_SECONDS:
             self._flashscore_map = build_schedule_map()
             self._flashscore_map_built_at = time.time()
 
     def _resolve_flashscore_id(self, match: Dict[str, Any]):
-        """
-        One-time resolution: match this fixture's 365Scores team names
-        against the Flashscore schedule map and persist the result.
-
-        Runs only while flashscore_id is still unset (and under the max
-        attempt cap) -- see FixtureStore.needs_flashscore_resolution().
-        After this succeeds once, _fetch_commentary() never calls this
-        again for this match_id; it just reads the stored ID.
-        """
+        """One-time resolution: match fixture against Flashscore schedule map."""
         match_id = match.get("matchId")
         home_team = match.get("homeTeam")
         away_team = match.get("awayTeam")
@@ -510,17 +481,11 @@ class Poller:
             attempts = match.get("flashscore_resolve_attempts", 0) + 1
             logger.warning(
                 f"⚠️  {match_id}: no Flashscore match for {home_team} vs {away_team} "
-                f"(attempt {attempts}/{FLASHSCORE_MAX_RESOLVE_ATTEMPTS} -- "
-                f"check flashscore.py's _ALIASES if this persists)"
+                f"(attempt {attempts}/{FLASHSCORE_MAX_RESOLVE_ATTEMPTS})"
             )
 
     def _fetch_commentary(self, match: Dict[str, Any]):
-        """
-        Fetch live commentary from Flashscore using the already-resolved
-        flashscore_id. No name-matching happens here -- if flashscore_id
-        isn't set yet (still resolving, or permanently unmatched), this
-        just skips silently for this cycle.
-        """
+        """Fetch live commentary from Flashscore."""
         match_id = match.get("matchId")
         flashscore_id = match.get("flashscore_id") or self.store.get_flashscore_id(match_id)
 
@@ -532,15 +497,22 @@ class Poller:
             commentary = fetch_live_commentary_by_id(flashscore_id)
 
             if commentary:
-                logger.info(
-                    f"📝 Got {len(commentary)} Flashscore commentary entries for {match_id}"
-                )
+                logger.info(f"📝 Got {len(commentary)} Flashscore commentary entries for {match_id}")
 
                 for entry in commentary:
+                    # Ensure entry has correct format for Rust API
+                    formatted_entry = {
+                        "minute": entry.get("minute", 0),
+                        "text": entry.get("text", ""),
+                        "event_type": entry.get("type") or entry.get("event_type", "general"),
+                        "team": entry.get("team"),
+                        "player": entry.get("player"),
+                        "created_at": entry.get("created_at") or entry.get("createdAt") or datetime.now(timezone.utc).isoformat(),
+                    }
                     self.forwarder.forward_commentary(
                         {
                             "match_id": match_id,
-                            "entry": entry,
+                            "entry": formatted_entry,
                         }
                     )
             else:
@@ -550,18 +522,10 @@ class Poller:
             logger.error(f"❌ Failed to fetch Flashscore commentary for {match_id}: {e}")
 
     def _fetch_and_forward_lineups(self, match: Dict[str, Any]) -> bool:
-        """Fetch lineups and forward to Rust API using the new /web/game/ endpoint.
-
-        Returns True only when lineups were actually fetched AND successfully
-        forwarded/persisted. The caller (_process_match) uses this to decide
-        whether it's safe to mark lineups as "done" for this match -- if we
-        return False (source has nothing yet, missing IDs, forward failed, or
-        an exception), the caller will keep retrying on subsequent cycles.
-        """
+        """Fetch lineups and forward to Rust API."""
         match_id = match.get("matchId")
         game_id = match.get("threesixtyfiveGameId")
 
-        # Get competitor IDs from match data (stored during scraping)
         away_id = match.get("away_competitor_id")
         home_id = match.get("home_competitor_id")
         competition_id = match.get("competition_id", 5930)
@@ -581,7 +545,6 @@ class Poller:
             )
 
             if lineups:
-                # Reshape into what the Rust API actually expects before forwarding
                 home_team = match.get("homeTeam", "Home")
                 away_team = match.get("awayTeam", "Away")
                 payload = _build_lineups_payload(match_id, home_team, away_team, lineups)
@@ -618,17 +581,16 @@ class Poller:
         )
 
         if stats:
-            stats["fixture_id"] = match_id
             minute = stats.get("minute", 0)
-            statistics = {
+            stats_data = {
                 "home": stats.get("home", {}),
                 "away": stats.get("away", {}),
             }
 
             payload = {
                 "fixture_id": match_id,
-                "statistics": statistics,
                 "minute": minute,
+                "statistics": stats_data,
             }
             self.forwarder.forward_statistics(payload)
             logger.debug(f"📊 Statistics forwarded for {match_id} at {minute}'")
@@ -658,37 +620,38 @@ class Poller:
         home_comp = game.get("homeCompetitor", {})
         away_comp = game.get("awayCompetitor", {})
 
-        # Update scores -- cast immediately, 365scores' API is inconsistent
-        # about returning score as int vs float in its JSON, and a float
-        # here ends up as a BSON double that Rust's Option<i32> rejects.
         raw_home_score = home_comp.get("score")
         raw_away_score = away_comp.get("score")
-        home_score = int(raw_home_score) if raw_home_score is not None else None
-        away_score = int(raw_away_score) if raw_away_score is not None else None
-        if home_score is not None:
+        home_score = int(raw_home_score) if raw_home_score is not None else 0
+        away_score = int(raw_away_score) if raw_away_score is not None else 0
+
+        if home_comp.get("score") is not None:
             self.store.update_score(match_id, home_score, away_score)
             logger.info(f"📊 {match_id}: Score updated {home_score}-{away_score}")
 
-        # Check if match ended -- locale-proof (see threesixtyfive.is_game_finished
-        # docstring: statusText comes back in whatever lang_id was requested,
-        # so English string matching here used to never fire)
         if threesixtyfive.is_game_finished(game):
             self.store.update_status(match_id, "completed")
             self._finalize_match_result(match)
             return
 
-        # Forward live update - FIXED: Added missing fields
         minute = game.get("gameTime", 0)
+
+        # ✅ FIXED: Match Rust LiveGameUpdate struct exactly
         live_update = {
             "fixture_id": match_id,
             "event_type": "live_update",
-            "home_score": home_score or 0,
-            "away_score": away_score or 0,
+            "home_score": home_score,
+            "away_score": away_score,
             "minute": minute,
             "minute_display": f"{minute}'" if minute > 0 else "0'",
             "status": "live",
             "is_live": True,
             "available_for_voting": False,
+            "scorer": None,
+            "player": None,
+            "assist": None,
+            "team": None,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         self.forwarder.forward_live_update(live_update)
 
@@ -730,8 +693,8 @@ class Poller:
         away_team = match.get("awayTeam", "Away")
 
         notification = {
-            "fixture_id": match_id,
-            "event_type": "match_live",
+            "fixtureId": match_id,
+            "eventType": "match_live",
             "title": f"⚽ {home_team} vs {away_team} is LIVE!",
             "body": "Match is now live. Follow the action!",
             "data": {

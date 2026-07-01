@@ -1,4 +1,3 @@
-
 """
 Forwards updates from poller to Rust backend API.
 Handles: fixtures, live updates, events, commentary, lineups, statistics, finalization, notifications.
@@ -42,11 +41,13 @@ class Forwarder:
         try:
             response = self.session.post(url, json=data, timeout=self.timeout)
             response.raise_for_status()
+            logger.info(f"✅ POST to {endpoint} successful")
             return True
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to POST to {endpoint}: {e}")
             if hasattr(e, 'response') and e.response:
                 logger.error(f"Response: {e.response.text[:500]}")
+                logger.error(f"Request data: {data}")
             return False
 
     def _put(self, endpoint: str, data: Dict[str, Any]) -> bool:
@@ -80,12 +81,14 @@ class Forwarder:
         return self._post("/games/bulk", {"fixtures": fixtures})
 
     # ============================================================
-    # LIVE UPDATES
+    # LIVE UPDATES - MATCHES RUST LiveGameUpdate
     # ============================================================
 
     def forward_live_update(self, update: Dict[str, Any]) -> bool:
-        if "timestamp" not in update:
-            update["timestamp"] = datetime.now(timezone.utc).isoformat()
+        """
+        Forward live update to Rust API.
+        Rust expects camelCase field names matching LiveGameUpdate struct.
+        """
         payload = {
             "fixtureId": update.get("fixture_id"),
             "eventType": update.get("event_type"),
@@ -106,44 +109,50 @@ class Forwarder:
 
     def forward_score_update(self, match_id: str, home_score: int, away_score: int, minute: int) -> bool:
         payload = {
-            "fixture_id": match_id,
-            "event_type": "score",
-            "home_score": home_score,
-            "away_score": away_score,
-            "minute": minute,
+            "matchId": match_id,
+            "homeScore": home_score,
+            "awayScore": away_score,
+            "timeElapsed": minute,
         }
-        return self._post("/games/score", payload)
+        return self._post(f"/games/{match_id}/score", payload)
 
     def forward_status_update(self, match_id: str, status: str, is_live: bool, available_for_voting: bool) -> bool:
         payload = {
-            "fixture_id": match_id,
+            "matchId": match_id,
             "status": status,
-            "is_live": is_live,
-            "available_for_voting": available_for_voting,
+            "isLive": is_live,
+            "availableForVoting": available_for_voting,
         }
-        return self._post("/games/status", payload)
+        return self._post(f"/games/{match_id}/status", payload)
 
     # ============================================================
     # EVENTS
     # ============================================================
 
     def forward_event(self, event: Dict[str, Any]) -> bool:
-        return self._post("/games/events", event)
+        payload = {
+            "fixtureId": event.get("fixture_id"),
+            "eventType": event.get("event_type"),
+            "minute": event.get("minute", 0),
+            "team": event.get("team"),
+            "player": event.get("player"),
+            "assist": event.get("assist"),
+            "homeScore": event.get("home_score", 0),
+            "awayScore": event.get("away_score", 0),
+        }
+        return self._post("/games/events", payload)
 
     def forward_bulk_events(self, bulk: Dict[str, Any]) -> bool:
         return self._post("/games/events/bulk", bulk)
 
-    def forward_event_batch(self, fixture_id: str, events: List[Dict[str, Any]]) -> bool:
-        return self._post(f"/games/{fixture_id}/events/batch", {"events": events})
-
     # ============================================================
-    # COMMENTARY
+    # COMMENTARY - MATCHES RUST CommentaryEntry
     # ============================================================
 
     def forward_commentary(self, commentary: Dict[str, Any]) -> bool:
         """
-        Forward commentary to the Rust API.
-        Rust expects "createdAt" (camelCase).
+        Forward commentary to Rust API.
+        Rust expects CommentaryEntry with camelCase fields.
         """
         entry = commentary.get("entry", {})
         payload = {
@@ -151,10 +160,10 @@ class Forwarder:
             "entry": {
                 "minute": entry.get("minute", 0),
                 "text": entry.get("text", ""),
-                "type": entry.get("type", "general"),
+                "type": entry.get("event_type") or entry.get("type", "general"),
                 "team": entry.get("team"),
                 "player": entry.get("player"),
-                "createdAt": entry.get("created_at", datetime.now(timezone.utc).isoformat()),
+                "createdAt": entry.get("created_at") or entry.get("createdAt") or datetime.now(timezone.utc).isoformat(),
             }
         }
         return self._post("/games/commentary", payload)
@@ -167,13 +176,13 @@ class Forwarder:
         return self._post("/games/commentary/bulk", payload)
 
     # ============================================================
-    # LINEUPS
+    # LINEUPS - MATCHES RUST LineupsUpdate
     # ============================================================
 
     def forward_lineups(self, lineups: Dict[str, Any]) -> bool:
         """
-        Forward lineups to the Rust API.
-        Rust expects camelCase field names.
+        Forward lineups to Rust API.
+        Rust expects LineupsUpdate with camelCase fields.
         """
         payload = {
             "fixtureId": lineups.get("fixture_id"),
@@ -188,50 +197,51 @@ class Forwarder:
 
     def forward_lineups_simplified(self, fixture_id: str, home_players: List[Dict], away_players: List[Dict]) -> bool:
         payload = {
-            "fixture_id": fixture_id,
+            "fixtureId": fixture_id,
             "home": home_players,
             "away": away_players,
         }
         return self._post("/games/lineups/simplified", payload)
 
     # ============================================================
-    # STATISTICS
+    # STATISTICS - MATCHES RUST StatisticsSnapshotPayload
     # ============================================================
 
     def forward_statistics(self, statistics: Dict[str, Any]) -> bool:
         """
-        Forward match statistics to the Rust API.
-        Rust expects snake_case field names.
+        Forward match statistics to Rust API.
+        Rust expects StatisticsSnapshotPayload with snake_case fields.
         """
+        stats = statistics.get("statistics", {})
         payload = {
             "fixture_id": statistics.get("fixture_id"),
             "minute": statistics.get("minute", 0),
             "statistics": {
                 "home": {
-                    "possession": statistics.get("statistics", {}).get("home", {}).get("possession"),
-                    "shots": statistics.get("statistics", {}).get("home", {}).get("shots"),
-                    "shots_on_target": statistics.get("statistics", {}).get("home", {}).get("shots_on_target"),
-                    "shots_off_target": statistics.get("statistics", {}).get("home", {}).get("shots_off_target"),
-                    "corners": statistics.get("statistics", {}).get("home", {}).get("corners"),
-                    "fouls": statistics.get("statistics", {}).get("home", {}).get("fouls"),
-                    "yellow_cards": statistics.get("statistics", {}).get("home", {}).get("yellow_cards"),
-                    "red_cards": statistics.get("statistics", {}).get("home", {}).get("red_cards"),
-                    "offsides": statistics.get("statistics", {}).get("home", {}).get("offsides"),
-                    "passes": statistics.get("statistics", {}).get("home", {}).get("passes"),
-                    "pass_accuracy": statistics.get("statistics", {}).get("home", {}).get("pass_accuracy"),
+                    "possession": stats.get("home", {}).get("possession"),
+                    "shots": stats.get("home", {}).get("shots"),
+                    "shots_on_target": stats.get("home", {}).get("shots_on_target"),
+                    "shots_off_target": stats.get("home", {}).get("shots_off_target"),
+                    "corners": stats.get("home", {}).get("corners"),
+                    "fouls": stats.get("home", {}).get("fouls"),
+                    "yellow_cards": stats.get("home", {}).get("yellow_cards"),
+                    "red_cards": stats.get("home", {}).get("red_cards"),
+                    "offsides": stats.get("home", {}).get("offsides"),
+                    "passes": stats.get("home", {}).get("passes"),
+                    "pass_accuracy": stats.get("home", {}).get("pass_accuracy"),
                 },
                 "away": {
-                    "possession": statistics.get("statistics", {}).get("away", {}).get("possession"),
-                    "shots": statistics.get("statistics", {}).get("away", {}).get("shots"),
-                    "shots_on_target": statistics.get("statistics", {}).get("away", {}).get("shots_on_target"),
-                    "shots_off_target": statistics.get("statistics", {}).get("away", {}).get("shots_off_target"),
-                    "corners": statistics.get("statistics", {}).get("away", {}).get("corners"),
-                    "fouls": statistics.get("statistics", {}).get("away", {}).get("fouls"),
-                    "yellow_cards": statistics.get("statistics", {}).get("away", {}).get("yellow_cards"),
-                    "red_cards": statistics.get("statistics", {}).get("away", {}).get("red_cards"),
-                    "offsides": statistics.get("statistics", {}).get("away", {}).get("offsides"),
-                    "passes": statistics.get("statistics", {}).get("away", {}).get("passes"),
-                    "pass_accuracy": statistics.get("statistics", {}).get("away", {}).get("pass_accuracy"),
+                    "possession": stats.get("away", {}).get("possession"),
+                    "shots": stats.get("away", {}).get("shots"),
+                    "shots_on_target": stats.get("away", {}).get("shots_on_target"),
+                    "shots_off_target": stats.get("away", {}).get("shots_off_target"),
+                    "corners": stats.get("away", {}).get("corners"),
+                    "fouls": stats.get("away", {}).get("fouls"),
+                    "yellow_cards": stats.get("away", {}).get("yellow_cards"),
+                    "red_cards": stats.get("away", {}).get("red_cards"),
+                    "offsides": stats.get("away", {}).get("offsides"),
+                    "passes": stats.get("away", {}).get("passes"),
+                    "pass_accuracy": stats.get("away", {}).get("pass_accuracy"),
                 }
             }
         }
@@ -284,10 +294,10 @@ class Forwarder:
 
     def forward_match_result(self, fixture_id: str, result: str, home_score: int, away_score: int) -> bool:
         payload = {
-            "fixture_id": fixture_id,
+            "fixtureId": fixture_id,
             "result": result,
-            "home_score": home_score,
-            "away_score": away_score,
+            "homeScore": home_score,
+            "awayScore": away_score,
         }
         return self._post("/games/result", payload)
 
@@ -303,8 +313,8 @@ class Forwarder:
 
     def forward_lineups_available_notification(self, fixture_id: str, home_team: str, away_team: str) -> bool:
         payload = {
-            "fixture_id": fixture_id,
-            "event_type": "lineups_available",
+            "fixtureId": fixture_id,
+            "eventType": "lineups_available",
             "title": f"📋 Lineups are out! {home_team} vs {away_team}",
             "body": f"Check the starting XI for {home_team} vs {away_team}.",
             "data": {
@@ -317,8 +327,8 @@ class Forwarder:
 
     def forward_match_live_notification(self, fixture_id: str, home_team: str, away_team: str) -> bool:
         payload = {
-            "fixture_id": fixture_id,
-            "event_type": "match_live",
+            "fixtureId": fixture_id,
+            "eventType": "match_live",
             "title": f"⚽ {home_team} vs {away_team} is LIVE!",
             "body": f"The match has kicked off! Follow the action.",
             "data": {
@@ -331,8 +341,8 @@ class Forwarder:
 
     def forward_goal_notification(self, fixture_id: str, scorer: str, minute: int, home_score: int, away_score: int) -> bool:
         payload = {
-            "fixture_id": fixture_id,
-            "event_type": "goal_scored",
+            "fixtureId": fixture_id,
+            "eventType": "goal_scored",
             "title": f"⚽ GOAL! {scorer} scores!",
             "body": f"{scorer} scores at {minute}'! Score: {home_score}-{away_score}",
             "data": {
@@ -347,8 +357,8 @@ class Forwarder:
 
     def forward_match_ended_notification(self, fixture_id: str, home_team: str, away_team: str, result: str) -> bool:
         payload = {
-            "fixture_id": fixture_id,
-            "event_type": "match_ended",
+            "fixtureId": fixture_id,
+            "eventType": "match_ended",
             "title": f"🏁 Full Time: {home_team} vs {away_team}",
             "body": f"Match ended. Result: {result}",
             "data": {
