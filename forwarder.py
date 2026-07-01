@@ -83,32 +83,35 @@ class Forwarder:
     # ============================================================
 
     def forward_live_update(self, update: Dict[str, Any]) -> bool:
-        """
-        Forward a live match update to the Rust API.
-        Rust expects camelCase field names.
-        """
-        payload = {
-            "fixtureId": update.get("fixture_id"),
-            "eventType": update.get("event_type", "live_update"),
-            "homeScore": update.get("home_score", 0),
-            "awayScore": update.get("away_score", 0),
-            "minute": update.get("minute", 0),
-            "minuteDisplay": update.get("minute_display", f"{update.get('minute', 0)}'"),
-            "status": update.get("status", "live"),
-            "isLive": update.get("is_live", True),
-            "availableForVoting": update.get("available_for_voting", False),
-        }
-        # Optional fields
-        if "scorer" in update:
-            payload["scorer"] = update["scorer"]
-        if "player" in update:
-            payload["player"] = update["player"]
-        if "assist" in update:
-            payload["assist"] = update["assist"]
-        if "team" in update:
-            payload["team"] = update["team"]
-        
-        return self._post("/games/live-update", payload)
+       if "timestamp" not in update:
+        update["timestamp"] = datetime.now(timezone.utc).isoformat()
+       payload = {
+        "fixtureId": update.get("fixture_id"),
+        "eventType": update.get("event_type"),
+        "homeScore": update.get("home_score", 0),
+        "awayScore": update.get("away_score", 0),
+        "minute": update.get("minute", 0),
+        "minuteDisplay": update.get("minute_display"),
+        "status": update.get("status"),
+        "isLive": update.get("is_live"),
+        "availableForVoting": update.get("available_for_voting"),
+        "scorer": update.get("scorer"),
+        "player": update.get("player"),
+        "assist": update.get("assist"),
+        "team": update.get("team"),
+        "timestamp": update.get("timestamp"),
+    }
+       return self._post("/games/live-update", payload)
+
+def forward_commentary(self, commentary: Dict[str, Any]) -> bool:
+    entry = dict(commentary.get("entry", {}))
+    if "created_at" in entry:
+        entry["createdAt"] = entry.pop("created_at")
+    entry.setdefault("createdAt", datetime.now(timezone.utc).isoformat())
+    if "event_type" in entry:
+        entry["type"] = entry.pop("event_type")
+    payload = {"match_id": commentary.get("match_id"), "entry": entry}
+    return self._post("/games/commentary", payload)
 
     def forward_score_update(self, match_id: str, home_score: int, away_score: int, minute: int) -> bool:
         payload = {

@@ -618,6 +618,7 @@ class Poller:
         )
 
         if stats:
+            stats["fixture_id"] = match_id
             minute = stats.get("minute", 0)
             statistics = {
                 "home": stats.get("home", {}),
