@@ -19,7 +19,6 @@ class Forwarder:
         self.api_url = api_url.rstrip("/")
         self.timeout = timeout
         
-        # Create session with retry logic
         self.session = requests.Session()
         self.session.headers.update({
             "Content-Type": "application/json",
@@ -27,7 +26,6 @@ class Forwarder:
             "User-Agent": "WorldCupPoller/1.0",
         })
         
-        # Retry strategy for transient failures
         retry_strategy = Retry(
             total=max_retries,
             backoff_factor=1,
@@ -39,7 +37,6 @@ class Forwarder:
         self.session.mount("https://", adapter)
 
     def _post(self, endpoint: str, data: Dict[str, Any]) -> bool:
-        """Generic POST request with error handling."""
         url = f"{self.api_url}{endpoint}"
         try:
             response = self.session.post(url, json=data, timeout=self.timeout)
@@ -52,7 +49,6 @@ class Forwarder:
             return False
 
     def _put(self, endpoint: str, data: Dict[str, Any]) -> bool:
-        """Generic PUT request with error handling."""
         url = f"{self.api_url}{endpoint}"
         try:
             response = self.session.put(url, json=data, timeout=self.timeout)
@@ -63,7 +59,6 @@ class Forwarder:
             return False
 
     def _get(self, endpoint: str, params: Optional[Dict] = None) -> Optional[Dict]:
-        """Generic GET request with error handling."""
         url = f"{self.api_url}{endpoint}"
         try:
             response = self.session.get(url, params=params, timeout=self.timeout)
@@ -78,51 +73,44 @@ class Forwarder:
     # ============================================================
 
     def forward_fixture(self, fixture: Dict[str, Any]) -> bool:
-        """
-        Forward a single fixture to the Rust API.
-        """
         return self._post("/games", fixture)
 
     def forward_fixtures_bulk(self, fixtures: List[Dict[str, Any]]) -> bool:
-        """
-        Forward multiple fixtures in bulk.
-        """
         return self._post("/games/bulk", {"fixtures": fixtures})
 
     # ============================================================
-    # LIVE UPDATES
+    # LIVE UPDATES - FIXED
     # ============================================================
 
     def forward_live_update(self, update: Dict[str, Any]) -> bool:
-        """
-        Forward a live match update to the Rust API.
-        Expected payload:
-        {
-            "fixture_id": "wc26_123",
-            "event_type": "live_update|score|status|goal|card|substitution",
-            "home_score": 1,
-            "away_score": 0,
-            "minute": 67,
-            "minute_display": "67'",
-            "status": "live|completed",
-            "is_live": true,
-            "available_for_voting": false,
-            "scorer": "home_team|away_team",
-            "player": "Player Name",
-            "assist": "Assist Name",
-            "team": "home|away"
+        """Forward a live match update to the Rust API."""
+        # Ensure all required fields are present
+        payload = {
+            "fixture_id": update.get("fixture_id"),
+            "event_type": update.get("event_type", "live_update"),
+            "home_score": update.get("home_score", 0),
+            "away_score": update.get("away_score", 0),
+            "minute": update.get("minute", 0),
+            "minute_display": update.get("minute_display", f"{update.get('minute', 0)}'"),
+            "status": update.get("status", "live"),
         }
-        """
-        # Add timestamp if not present
-        if "timestamp" not in update:
-            update["timestamp"] = datetime.now(timezone.utc).isoformat()
+        # Add optional fields if present
+        if "is_live" in update:
+            payload["is_live"] = update["is_live"]
+        if "available_for_voting" in update:
+            payload["available_for_voting"] = update["available_for_voting"]
+        if "scorer" in update:
+            payload["scorer"] = update["scorer"]
+        if "player" in update:
+            payload["player"] = update["player"]
+        if "assist" in update:
+            payload["assist"] = update["assist"]
+        if "team" in update:
+            payload["team"] = update["team"]
         
-        return self._post("/games/live-update", update)
+        return self._post("/games/live-update", payload)
 
     def forward_score_update(self, match_id: str, home_score: int, away_score: int, minute: int) -> bool:
-        """
-        Forward a score update.
-        """
         payload = {
             "fixture_id": match_id,
             "event_type": "score",
@@ -133,9 +121,6 @@ class Forwarder:
         return self._post("/games/score", payload)
 
     def forward_status_update(self, match_id: str, status: str, is_live: bool, available_for_voting: bool) -> bool:
-        """
-        Forward a status update.
-        """
         payload = {
             "fixture_id": match_id,
             "status": status,
@@ -145,77 +130,40 @@ class Forwarder:
         return self._post("/games/status", payload)
 
     # ============================================================
-    # EVENTS (Goals, Cards, Substitutions)
+    # EVENTS
     # ============================================================
 
     def forward_event(self, event: Dict[str, Any]) -> bool:
-        """
-        Forward a single event to the Rust API.
-        Expected payload:
-        {
-            "fixture_id": "wc26_123",
-            "event_type": "goal|yellow_card|red_card|substitution|penalty|own_goal",
-            "minute": 23,
-            "team": "home|away",
-            "player": "Player Name",
-            "assist": "Assist Name (optional)",
-            "home_score": 1,
-            "away_score": 0,
-        }
-        """
         return self._post("/games/events", event)
 
     def forward_bulk_events(self, bulk: Dict[str, Any]) -> bool:
-        """
-        Forward multiple events at once.
-        Expected payload:
-        {
-            "fixture_id": "wc26_123",
-            "events": [
-                {
-                    "event_type": "goal",
-                    "minute": 23,
-                    "team": "home",
-                    "player": "Player Name",
-                    ...
-                }
-            ]
-        }
-        """
         return self._post("/games/events/bulk", bulk)
 
     def forward_event_batch(self, fixture_id: str, events: List[Dict[str, Any]]) -> bool:
-        """
-        Forward a batch of events for a fixture.
-        """
         return self._post(f"/games/{fixture_id}/events/batch", {"events": events})
 
     # ============================================================
-    # COMMENTARY
+    # COMMENTARY - FIXED
     # ============================================================
 
     def forward_commentary(self, commentary: Dict[str, Any]) -> bool:
-        """
-        Forward commentary to the Rust API.
-        Expected payload:
-        {
-            "match_id": "wc26_123",
+        """Forward commentary to the Rust API."""
+        # Ensure entry has all required fields
+        entry = commentary.get("entry", {})
+        payload = {
+            "match_id": commentary.get("match_id"),
             "entry": {
-                "minute": 23,
-                "text": "Great goal by Player!",
-                "type": "goal|chance|card|substitution|general",
-                "team": "home|away",
-                "player": "Player Name",
-                "created_at": "2026-06-27T15:00:00Z"
+                "minute": entry.get("minute", 0),
+                "text": entry.get("text", ""),
+                "type": entry.get("type", "general"),
+                "team": entry.get("team"),
+                "player": entry.get("player"),
+                "created_at": entry.get("created_at", datetime.now(timezone.utc).isoformat())
             }
         }
-        """
-        return self._post("/games/commentary", commentary)
+        return self._post("/games/commentary", payload)
 
     def forward_commentary_bulk(self, fixture_id: str, entries: List[Dict[str, Any]]) -> bool:
-        """
-        Forward multiple commentary entries for a fixture.
-        """
         payload = {
             "match_id": fixture_id,
             "entries": entries
@@ -223,49 +171,23 @@ class Forwarder:
         return self._post("/games/commentary/bulk", payload)
 
     # ============================================================
-    # LINEUPS - FIXED
+    # LINEUPS - WORKING
     # ============================================================
 
     def forward_lineups(self, lineups: Dict[str, Any]) -> bool:
-        """
-        Forward lineups to the Rust API.
-        """
-        # Convert to exact Rust API format
+        """Forward lineups to the Rust API."""
         payload = {
             "fixtureId": lineups.get("fixture_id"),
             "homeTeam": lineups.get("home_team"),
             "awayTeam": lineups.get("away_team"),
             "lineups": {
-                "home": self._convert_lineup_side(lineups.get("lineups", {}).get("home", {})),
-                "away": self._convert_lineup_side(lineups.get("lineups", {}).get("away", {}))
+                "home": lineups.get("lineups", {}).get("home", {}),
+                "away": lineups.get("lineups", {}).get("away", {})
             }
         }
         return self._post("/games/lineups", payload)
-    
-    def _convert_lineup_side(self, side: Dict[str, Any]) -> Dict[str, Any]:
-        """Convert lineup side to Rust API format."""
-        return {
-            "formation": side.get("formation", "4-4-2"),
-            "coach": {"name": side.get("coach", {}).get("name", "Unknown")},
-            "players": self._convert_players(side.get("players", [])),
-            "bench": self._convert_players(side.get("bench", []))
-        }
-    
-    def _convert_players(self, players: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Convert players to Rust API format."""
-        return [{
-            "name": p.get("name", "Unknown"),
-            "position": p.get("position", "Unknown"),
-            "jerseyNumber": p.get("jerseyNumber", 0),
-            "captain": p.get("captain", False),
-            "lineup": p.get("lineup", "starting"),
-            "playerId": p.get("playerId")
-        } for p in players]
 
     def forward_lineups_simplified(self, fixture_id: str, home_players: List[Dict], away_players: List[Dict]) -> bool:
-        """
-        Forward simplified lineups (just starting XI).
-        """
         payload = {
             "fixture_id": fixture_id,
             "home": home_players,
@@ -278,66 +200,27 @@ class Forwarder:
     # ============================================================
 
     def forward_statistics(self, statistics: Dict[str, Any]) -> bool:
-        """
-        Forward match statistics to the Rust API.
-        """
+        """Forward match statistics to the Rust API."""
         payload = {
             "fixture_id": statistics.get("fixture_id"),
             "minute": statistics.get("minute", 0),
             "statistics": {
-                "home": self._convert_statistics_side(statistics.get("statistics", {}).get("home", {})),
-                "away": self._convert_statistics_side(statistics.get("statistics", {}).get("away", {}))
+                "home": statistics.get("statistics", {}).get("home", {}),
+                "away": statistics.get("statistics", {}).get("away", {})
             }
         }
         return self._post("/games/statistics", payload)
-    
-    def _convert_statistics_side(self, side: Dict[str, Any]) -> Dict[str, Any]:
-        """Convert statistics to Rust API format."""
-        return {
-            "possession": side.get("possession"),
-            "shots": side.get("shots"),
-            "shots_on_target": side.get("shots_on_target"),
-            "shots_off_target": side.get("shots_off_target"),
-            "corners": side.get("corners"),
-            "fouls": side.get("fouls"),
-            "yellow_cards": side.get("yellow_cards"),
-            "red_cards": side.get("red_cards"),
-            "offsides": side.get("offsides"),
-            "passes": side.get("passes"),
-            "pass_accuracy": side.get("pass_accuracy")
-        }
 
     def forward_statistics_bulk(self, stats_bulk: Dict[str, Any]) -> bool:
-        """
-        Forward multiple statistics snapshots at once.
-        """
-        snapshots = stats_bulk.get("snapshots", [])
-        converted_snapshots = []
-        for snapshot in snapshots:
-            converted_snapshots.append({
-                "minute": snapshot.get("minute", 0),
-                "statistics": {
-                    "home": self._convert_statistics_side(snapshot.get("statistics", {}).get("home", {})),
-                    "away": self._convert_statistics_side(snapshot.get("statistics", {}).get("away", {}))
-                }
-            })
-        
-        payload = {
-            "fixture_id": stats_bulk.get("fixture_id"),
-            "snapshots": converted_snapshots
-        }
-        return self._post("/games/statistics/bulk", payload)
+        return self._post("/games/statistics/bulk", stats_bulk)
 
     def forward_statistics_snapshot(self, fixture_id: str, minute: int, stats: Dict[str, Any]) -> bool:
-        """
-        Forward a single statistics snapshot.
-        """
         payload = {
             "fixture_id": fixture_id,
             "minute": minute,
             "statistics": {
-                "home": self._convert_statistics_side(stats.get("home", {})),
-                "away": self._convert_statistics_side(stats.get("away", {}))
+                "home": stats.get("home", {}),
+                "away": stats.get("away", {})
             }
         }
         return self._post("/games/statistics/snapshot", payload)
@@ -347,15 +230,9 @@ class Forwarder:
     # ============================================================
 
     def finalize_match(self, finalize_data: Dict[str, Any]) -> bool:
-        """
-        Finalize match result.
-        """
         return self._post("/games/finalize", finalize_data)
 
     def forward_match_result(self, fixture_id: str, result: str, home_score: int, away_score: int) -> bool:
-        """
-        Forward just the match result.
-        """
         payload = {
             "fixture_id": fixture_id,
             "result": result,
@@ -365,9 +242,6 @@ class Forwarder:
         return self._post("/games/result", payload)
 
     def move_to_history(self, fixture_id: str) -> bool:
-        """
-        Move a completed match to history.
-        """
         return self._post(f"/games/{fixture_id}/move-to-history", {})
 
     # ============================================================
@@ -375,15 +249,9 @@ class Forwarder:
     # ============================================================
 
     def forward_notification(self, notification: Dict[str, Any]) -> bool:
-        """
-        Forward a notification to the Rust API.
-        """
         return self._post("/games/notify", notification)
 
     def forward_lineups_available_notification(self, fixture_id: str, home_team: str, away_team: str) -> bool:
-        """
-        Send notification that lineups are available.
-        """
         payload = {
             "fixture_id": fixture_id,
             "event_type": "lineups_available",
@@ -398,9 +266,6 @@ class Forwarder:
         return self._post("/games/notify", payload)
 
     def forward_match_live_notification(self, fixture_id: str, home_team: str, away_team: str) -> bool:
-        """
-        Send notification that match is live.
-        """
         payload = {
             "fixture_id": fixture_id,
             "event_type": "match_live",
@@ -415,9 +280,6 @@ class Forwarder:
         return self._post("/games/notify", payload)
 
     def forward_goal_notification(self, fixture_id: str, scorer: str, minute: int, home_score: int, away_score: int) -> bool:
-        """
-        Send notification that a goal was scored.
-        """
         payload = {
             "fixture_id": fixture_id,
             "event_type": "goal_scored",
@@ -434,9 +296,6 @@ class Forwarder:
         return self._post("/games/notify", payload)
 
     def forward_match_ended_notification(self, fixture_id: str, home_team: str, away_team: str, result: str) -> bool:
-        """
-        Send notification that match has ended.
-        """
         payload = {
             "fixture_id": fixture_id,
             "event_type": "match_ended",
@@ -456,27 +315,15 @@ class Forwarder:
     # ============================================================
 
     def get_game(self, match_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Get a game by match_id from the Rust API.
-        """
         return self._get(f"/games/match/{match_id}")
 
     def get_live_games(self) -> Optional[List[Dict[str, Any]]]:
-        """
-        Get all live games from the Rust API.
-        """
         return self._get("/games/live")
 
     def get_upcoming_games(self) -> Optional[List[Dict[str, Any]]]:
-        """
-        Get all upcoming games from the Rust API.
-        """
         return self._get("/games/upcoming")
 
     def get_history_games(self, limit: int = 50, skip: int = 0) -> Optional[List[Dict[str, Any]]]:
-        """
-        Get history games from the Rust API.
-        """
         return self._get("/games/history", {"limit": limit, "skip": skip})
 
     # ============================================================
@@ -484,15 +331,9 @@ class Forwarder:
     # ============================================================
 
     def sync_fixtures(self, fixtures: List[Dict[str, Any]]) -> bool:
-        """
-        Sync all fixtures at once (full update).
-        """
         return self._post("/games/sync", {"fixtures": fixtures})
 
     def sync_live_data(self, live_data: Dict[str, Any]) -> bool:
-        """
-        Sync live data for multiple matches at once.
-        """
         return self._post("/games/sync/live", live_data)
 
     # ============================================================
@@ -500,16 +341,10 @@ class Forwarder:
     # ============================================================
 
     def health_check(self) -> bool:
-        """
-        Check if the Rust API is healthy.
-        """
         result = self._get("/health")
         return result is not None and result.get("status") == "healthy"
 
     def ping(self) -> bool:
-        """
-        Simple ping to check API availability.
-        """
         try:
             response = self.session.get(f"{self.api_url}/ping", timeout=5)
             return response.status_code == 200
@@ -517,14 +352,7 @@ class Forwarder:
             return False
 
 
-# ============================================================
-# FACTORY FUNCTION
-# ============================================================
-
 def create_forwarder(api_url: str = None, **kwargs) -> Forwarder:
-    """
-    Create a Forwarder instance with optional configuration.
-    """
     import os
     if api_url is None:
         api_url = os.environ.get("FANCLASH_API", "https://clash-api-m5mr.onrender.com/api")
