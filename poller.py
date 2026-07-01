@@ -3,6 +3,7 @@
 Live poller for World Cup matches with full state machine.
 Handles: upcoming → soon → live → completed → archived
 Fetches lineups when matches are in "soon" state (40-60 mins before kickoff)
+Uses ONLY 365Scores for all data (scores, statistics, lineups, commentary)
 """
 from __future__ import annotations
 
@@ -15,7 +16,6 @@ from typing import Any, Dict, Optional, List
 
 from dotenv import load_dotenv
 
-from flashscore import build_schedule_map, resolve_from_map, fetch_live_commentary_by_id
 from forwarder import Forwarder
 from mongo_store import FixtureStore
 from sources import threesixtyfive
@@ -121,10 +121,6 @@ SOON_THRESHOLD_MINUTES = 60
 LINEUP_EARLY_THRESHOLD = 60
 LINEUP_LATE_THRESHOLD = 40
 STATS_THRESHOLD_MINUTES = 10
-
-# Flashscore name->ID resolution
-FLASHSCORE_MAP_TTL_SECONDS = 6 * 3600
-FLASHSCORE_MAX_RESOLVE_ATTEMPTS = 5
 
 # Archive check interval
 ARCHIVE_CHECK_INTERVAL_SECONDS = 3600
@@ -318,21 +314,22 @@ class Poller:
         self.running = False
         self.poll_count = 0
 
-        self._flashscore_map: Dict[tuple, str] = {}
-        self._flashscore_map_built_at: float = 0.0
         self._last_archive_check: float = 0.0
 
     def _format_timestamp(self, ts) -> str:
-        """Format timestamp for Rust DateTime<Utc> - MUST include timezone"""
+        """Format timestamp for Rust DateTime<Utc> - MUST include timezone and milliseconds"""
         if ts is None:
-            return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+            return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
         if isinstance(ts, datetime):
-            return ts.isoformat().replace('+00:00', 'Z')
+            return ts.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
         if isinstance(ts, str):
+            if '.' not in ts:
+                ts = ts.replace('Z', '').replace('+00:00', '')
+                ts = ts + ".000Z"
             if not ts.endswith('Z') and '+' not in ts:
-                return ts + 'Z'
+                ts = ts + "Z"
             return ts
-        return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
     def start(self):
         """Start polling loop."""
@@ -453,13 +450,20 @@ class Poller:
         if self.state_machine.should_fetch_statistics(match, current_status, minutes_to_kickoff):
             self._fetch_and_forward_statistics(match)
 
-        # --- STEP 4: FETCH LIVE UPDATES (if live) ---
+        # --- STEP 4: FETCH LIVE UPDATES AND COMMENTARY (if live) ---
         if current_status == "live":
-            self._fetch_live_updates(match)
-
-            if self.store.needs_flashscore_resolution(match, FLASHSCORE_MAX_RESOLVE_ATTEMPTS):
-                self._resolve_flashscore_id(match)
-            self._fetch_commentary(match)
+            # Fetch game details once - use for both live updates AND commentary
+            game_data = self._fetch_full_game_data(match)
+            
+            if game_data:
+                # Process live updates (scores, status, completion)
+                self._process_live_updates(match, game_data)
+                
+                # Process commentary from 365Scores (NOT Flashscore)
+                self._process_commentary(match, game_data)
+            else:
+                # Fallback: fetch live updates separately if full data fails
+                self._fetch_live_updates(match)
 
         # --- STEP 5: CHECK COMPLETION ---
         if self.state_machine.should_finalize_result(match):
@@ -467,79 +471,186 @@ class Poller:
 
         self.store.record_last_poll(match_id)
 
-    def _ensure_flashscore_map(self):
-        """Build or refresh the in-memory Flashscore schedule map."""
-        age = time.time() - self._flashscore_map_built_at
-        if not self._flashscore_map or age > FLASHSCORE_MAP_TTL_SECONDS:
-            self._flashscore_map = build_schedule_map()
-            self._flashscore_map_built_at = time.time()
-
-    def _resolve_flashscore_id(self, match: Dict[str, Any]):
-        """One-time resolution: match fixture against Flashscore schedule map."""
+    def _fetch_full_game_data(self, match: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Fetch full game data from 365Scores once per poll cycle.
+        Returns the game object containing all data (scores, commentary, stats).
+        """
         match_id = match.get("matchId")
-        home_team = match.get("homeTeam")
-        away_team = match.get("awayTeam")
+        game_id = match.get("threesixtyfiveGameId")
+        away_id = match.get("away_competitor_id")
+        home_id = match.get("home_competitor_id")
+        competition_id = match.get("competition_id", 5930)
 
-        if not home_team or not away_team:
-            logger.debug(f"Missing team names for {match_id}, cannot resolve Flashscore ID")
+        if not all([game_id, away_id, home_id]):
+            return None
+
+        details = threesixtyfive.fetch_game_details(
+            game_id=game_id,
+            away_id=away_id,
+            home_id=home_id,
+            competition_id=competition_id,
+        )
+
+        if not details or "game" not in details:
+            return None
+
+        return details.get("game", {})
+
+    def _process_live_updates(self, match: Dict[str, Any], game: Dict[str, Any]):
+        """
+        Process live updates from 365Scores game data.
+        Updates scores, checks completion, sends live updates.
+        """
+        match_id = match.get("matchId")
+        
+        home_comp = game.get("homeCompetitor", {})
+        away_comp = game.get("awayCompetitor", {})
+
+        # ENSURE ALL ARE INT
+        raw_home_score = home_comp.get("score")
+        raw_away_score = away_comp.get("score")
+        home_score = int(raw_home_score) if raw_home_score is not None else 0
+        away_score = int(raw_away_score) if raw_away_score is not None else 0
+
+        if home_comp.get("score") is not None:
+            self.store.update_score(match_id, home_score, away_score)
+            logger.info(f"📊 {match_id}: Score updated {home_score}-{away_score}")
+
+        # Check if game is finished using multiple methods
+        is_finished = threesixtyfive.is_game_finished(game)
+        
+        # Fallback: time-based completion check
+        if not is_finished:
+            time_elapsed = game.get("gameTime", 0)
+            status_text = game.get("statusText", "")
+            
+            if time_elapsed >= 90:
+                if "Extra" not in status_text and "Half" not in status_text:
+                    logger.info(f"⏰ {match_id}: timeElapsed {time_elapsed} >= 90, marking as finished")
+                    is_finished = True
+
+        if is_finished:
+            logger.info(f"🏁 {match_id}: Game finished! Final score: {home_score}-{away_score}")
+            self.store.update_status(match_id, "completed")
+            
+            # Send final live update
+            live_update = {
+                "fixture_id": match_id,
+                "event_type": "match_end",
+                "home_score": home_score,
+                "away_score": away_score,
+                "minute": game.get("gameTime", 90),
+                "minute_display": "FT",
+                "status": "completed",
+                "is_live": False,
+                "available_for_voting": False,
+                "timestamp": self._format_timestamp(None),
+            }
+            self.forwarder.forward_live_update(live_update)
+            
+            self._finalize_match_result(match)
             return
 
-        self._ensure_flashscore_map()
+        minute = int(game.get("gameTime", 0))
 
-        fs_id = resolve_from_map(self._flashscore_map, home_team, away_team)
+        # Send live update
+        live_update = {
+            "fixture_id": match_id,
+            "event_type": "live_update",
+            "home_score": home_score,
+            "away_score": away_score,
+            "minute": minute,
+            "minute_display": f"{minute}'" if minute > 0 else "0'",
+            "status": "live",
+            "is_live": True,
+            "available_for_voting": False,
+            "timestamp": self._format_timestamp(None),
+        }
+        self.forwarder.forward_live_update(live_update)
 
-        if fs_id:
-            self.store.set_flashscore_id(match_id, fs_id)
-            logger.info(f"🔗 {match_id}: resolved Flashscore ID {fs_id} ({home_team} vs {away_team})")
-        else:
-            self.store.record_flashscore_resolve_attempt(match_id)
-            attempts = match.get("flashscore_resolve_attempts", 0) + 1
-            logger.warning(
-                f"⚠️  {match_id}: no Flashscore match for {home_team} vs {away_team} "
-                f"(attempt {attempts}/{FLASHSCORE_MAX_RESOLVE_ATTEMPTS})"
+    def _process_commentary(self, match: Dict[str, Any], game: Dict[str, Any]):
+        """
+        Process commentary from 365Scores game data.
+        Formats entries to match Rust CommentaryEntry and forwards them.
+        """
+        match_id = match.get("matchId")
+        
+        # Get commentary from 365Scores game data
+        raw_commentary = game.get("commentary", [])
+        
+        if not raw_commentary:
+            logger.debug(f"No 365Scores commentary available for {match_id}")
+            return
+
+        logger.info(f"📝 Got {len(raw_commentary)} 365Scores commentary entries for {match_id}")
+
+        for entry in raw_commentary:
+            # Extract minute
+            minute = entry.get("minute", 0)
+            if isinstance(minute, str):
+                try:
+                    minute = int(minute)
+                except (ValueError, TypeError):
+                    minute = 0
+            
+            # Extract team and player names
+            team = None
+            if entry.get("team") and isinstance(entry.get("team"), dict):
+                team = entry.get("team", {}).get("name")
+            
+            player = None
+            if entry.get("player") and isinstance(entry.get("player"), dict):
+                player = entry.get("player", {}).get("name")
+            
+            # Get event type
+            event_type = entry.get("type", "commentary")
+            
+            # Format to match Rust CommentaryEntry EXACTLY
+            formatted_entry = {
+                "minute": int(minute),
+                "text": str(entry.get("text", "")),
+                "type": str(event_type),
+                "team": team,
+                "player": player,
+                "createdAt": self._format_timestamp(None),
+            }
+            
+            self.forwarder.forward_commentary(
+                {
+                    "match_id": match_id,
+                    "entry": formatted_entry,
+                }
             )
 
-    def _fetch_commentary(self, match: Dict[str, Any]):
+    def _fetch_live_updates(self, match: Dict[str, Any]):
         """
-        Fetch live commentary from Flashscore.
-        Entries are formatted to match Rust CommentaryEntry EXACTLY.
+        Fallback: Fetch live updates separately if full data fetch fails.
         """
         match_id = match.get("matchId")
-        flashscore_id = match.get("flashscore_id") or self.store.get_flashscore_id(match_id)
+        game_id = match.get("threesixtyfiveGameId")
+        away_id = match.get("away_competitor_id")
+        home_id = match.get("home_competitor_id")
+        competition_id = match.get("competition_id", 5930)
 
-        if not flashscore_id:
-            logger.debug(f"No Flashscore ID yet for {match_id}, skipping commentary this cycle")
+        if not all([game_id, away_id, home_id]):
             return
 
-        try:
-            commentary = fetch_live_commentary_by_id(flashscore_id)
+        details = threesixtyfive.fetch_game_details(
+            game_id=game_id,
+            away_id=away_id,
+            home_id=home_id,
+            competition_id=competition_id,
+        )
 
-            if commentary:
-                logger.info(f"📝 Got {len(commentary)} Flashscore commentary entries for {match_id}")
+        if not details or "game" not in details:
+            return
 
-                for entry in commentary:
-                    # ✅ FIXED: Match Rust CommentaryEntry EXACTLY
-                    formatted_entry = {
-                        "minute": int(entry.get("minute", 0)),
-                        "text": str(entry.get("text", "")),
-                        "type": entry.get("type") or entry.get("event_type") or "general",
-                        "team": entry.get("team"),
-                        "player": entry.get("player"),
-                        "createdAt": self._format_timestamp(
-                            entry.get("createdAt") or entry.get("created_at")
-                        ),
-                    }
-                    self.forwarder.forward_commentary(
-                        {
-                            "match_id": match_id,
-                            "entry": formatted_entry,
-                        }
-                    )
-            else:
-                logger.debug(f"No Flashscore commentary available for {match_id}")
-
-        except Exception as e:
-            logger.error(f"❌ Failed to fetch Flashscore commentary for {match_id}: {e}")
+        game = details.get("game", {})
+        
+        # Process using the main method
+        self._process_live_updates(match, game)
+        self._process_commentary(match, game)
 
     def _fetch_and_forward_lineups(self, match: Dict[str, Any]) -> bool:
         """Fetch lineups and forward to Rust API."""
@@ -615,66 +726,6 @@ class Poller:
             self.forwarder.forward_statistics(payload)
             logger.debug(f"📊 Statistics forwarded for {match_id} at {minute}'")
 
-    def _fetch_live_updates(self, match: Dict[str, Any]):
-        """
-        Fetch live updates (scores, events, commentary).
-        ALL fields match Rust LiveGameUpdate EXACTLY.
-        """
-        match_id = match.get("matchId")
-        game_id = match.get("threesixtyfiveGameId")
-        away_id = match.get("away_competitor_id")
-        home_id = match.get("home_competitor_id")
-        competition_id = match.get("competition_id", 5930)
-
-        if not all([game_id, away_id, home_id]):
-            return
-
-        details = threesixtyfive.fetch_game_details(
-            game_id=game_id,
-            away_id=away_id,
-            home_id=home_id,
-            competition_id=competition_id,
-        )
-
-        if not details or "game" not in details:
-            return
-
-        game = details.get("game", {})
-        home_comp = game.get("homeCompetitor", {})
-        away_comp = game.get("awayCompetitor", {})
-
-        # ENSURE ALL ARE INT
-        raw_home_score = home_comp.get("score")
-        raw_away_score = away_comp.get("score")
-        home_score = int(raw_home_score) if raw_home_score is not None else 0
-        away_score = int(raw_away_score) if raw_away_score is not None else 0
-
-        if home_comp.get("score") is not None:
-            self.store.update_score(match_id, home_score, away_score)
-            logger.info(f"📊 {match_id}: Score updated {home_score}-{away_score}")
-
-        if threesixtyfive.is_game_finished(game):
-            self.store.update_status(match_id, "completed")
-            self._finalize_match_result(match)
-            return
-
-        minute = int(game.get("gameTime", 0))
-
-        # ✅ FIXED: Match Rust LiveGameUpdate EXACTLY
-        live_update = {
-            "fixture_id": match_id,
-            "event_type": "live_update",
-            "home_score": home_score,
-            "away_score": away_score,
-            "minute": minute,
-            "minute_display": f"{minute}'" if minute > 0 else "0'",
-            "status": "live",
-            "is_live": True,
-            "available_for_voting": False,
-            "timestamp": self._format_timestamp(None),
-        }
-        self.forwarder.forward_live_update(live_update)
-
     def _finalize_match_result(self, match: Dict[str, Any]):
         """
         Finalize match result and notify Rust API.
@@ -697,7 +748,6 @@ class Poller:
         else:
             result = "draw"
 
-        # ✅ FIXED: Only send fixture_id and result
         finalize_payload = {
             "fixture_id": match_id,
             "result": result,

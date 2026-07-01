@@ -1,6 +1,6 @@
 """
 365Scores API client for World Cup data.
-Fetches: fixtures, live scores, events, lineups, and statistics.
+Fetches: fixtures, live scores, events, lineups, statistics, and commentary.
 """
 from __future__ import annotations
 
@@ -25,27 +25,18 @@ DEFAULT_HEADERS = {
 
 def is_game_finished(game: Dict[str, Any]) -> bool:
     """
-    Determine if a game has finished -- without relying solely on
-    localized statusText.
+    Determine if a game has finished.
 
-    fetch_game_details() defaults to lang_id=37 (Dutch), so statusText
-    can come back as e.g. "Eerste helft" (first half) instead of English.
-    Confirmed on 365scores.com that finished matches show the word
-    "Ended" -- so that's checked too, but isFinished/justEnded are
-    checked first since they don't depend on language at all.
+    365Scores uses "Ended" as the primary status text for completed games.
+    Other possible values: "Finished", "FT", "Full Time", "AET", "Pen"
 
     Signals checked, in order:
-      1. game.chartEvents.statuses[0].isFinished -- explicit bool for
-         whatever the current statusId is
+      1. game.chartEvents.statuses[0].isFinished -- explicit bool
       2. game.justEnded -- fires the moment a match ends
-      3. game.statusText.strip().lower() == "ended" (or other known
-         finished synonyms) -- confirmed real-world value from
-         365scores.com is "Ended"
-
-    Falls back to False (not finished) if none of these fire, since
-    that's the safer default (keeps polling rather than wrongly
-    archiving a live match).
+      3. game.statusText -- confirmed 365Scores value is "Ended"
+      4. game.gameTime >= 90 with no extra time
     """
+    # Check 1: Explicit isFinished flag
     try:
         statuses = (game.get("chartEvents") or {}).get("statuses") or []
         if statuses and "isFinished" in statuses[0]:
@@ -53,11 +44,29 @@ def is_game_finished(game: Dict[str, Any]) -> bool:
     except (AttributeError, IndexError, TypeError):
         pass
 
+    # Check 2: justEnded flag
     if game.get("justEnded"):
         return True
 
+    # Check 3: statusText - 365Scores uses "Ended"
     status_text = (game.get("statusText") or "").strip().lower()
-    if status_text in ("ended", "finished", "ft", "full-time"):
+    finished_keywords = ["ended", "finished", "ft", "full-time", "aet", "pen", "penalties"]
+    if status_text in finished_keywords:
+        return True
+
+    # Check 4: Time-based fallback - if gameTime >= 90 and not extra time
+    time_elapsed = game.get("gameTime", 0)
+    if time_elapsed >= 90:
+        # Don't mark if it's half time or extra time
+        if "half" not in status_text and "extra" not in status_text:
+            # Also check if we have a winner (both scores set)
+            home_comp = game.get("homeCompetitor", {})
+            away_comp = game.get("awayCompetitor", {})
+            if home_comp.get("score") is not None and away_comp.get("score") is not None:
+                return True
+
+    # Check 5: If game has ended but statusText contains "ended" in any form
+    if "ended" in status_text:
         return True
 
     return False
@@ -109,8 +118,8 @@ def fetch_game_details(
     away_id: int,
     home_id: int,
     competition_id: int,
-    lang_id: int = 37,
-    user_country_id: int = 7
+    lang_id: int = 1,
+    user_country_id: int = 413
 ) -> Optional[Dict[str, Any]]:
     """
     Fetch full game details including lineups using the /web/game/ endpoint.
@@ -120,11 +129,11 @@ def fetch_game_details(
         away_id: Away team competitor ID
         home_id: Home team competitor ID
         competition_id: Competition ID (e.g., 5930)
-        lang_id: Language ID (37 = Dutch, 1 = English)
-        user_country_id: Country ID (7 = Netherlands, 413 = Kenya)
+        lang_id: Language ID (1 = English)
+        user_country_id: Country ID (413 = Kenya)
     
     Returns:
-        Full game data including lineups, statistics, events, etc.
+        Full game data including lineups, statistics, events, commentary
     """
     matchup_id = f"{away_id}-{home_id}-{competition_id}"
     
@@ -249,24 +258,98 @@ def fetch_statistics(
             "possession": game.get("homePossession"),
             "shots": game.get("homeShots"),
             "shots_on_target": game.get("homeShotsOnTarget"),
+            "shots_off_target": game.get("homeShotsOffTarget"),
             "corners": game.get("homeCorners"),
             "fouls": game.get("homeFouls"),
             "yellow_cards": game.get("homeYellowCards"),
             "red_cards": game.get("homeRedCards"),
+            "offsides": game.get("homeOffsides"),
+            "passes": game.get("homePasses"),
+            "pass_accuracy": game.get("homePassAccuracy"),
         },
         "away": {
             "possession": game.get("awayPossession"),
             "shots": game.get("awayShots"),
             "shots_on_target": game.get("awayShotsOnTarget"),
+            "shots_off_target": game.get("awayShotsOffTarget"),
             "corners": game.get("awayCorners"),
             "fouls": game.get("awayFouls"),
             "yellow_cards": game.get("awayYellowCards"),
             "red_cards": game.get("awayRedCards"),
+            "offsides": game.get("awayOffsides"),
+            "passes": game.get("awayPasses"),
+            "pass_accuracy": game.get("awayPassAccuracy"),
         },
         "minute": game.get("gameTime", 0)
     }
     
     return stats
+
+
+def fetch_commentary(
+    game_id: str,
+    away_id: int,
+    home_id: int,
+    competition_id: int
+) -> List[Dict[str, Any]]:
+    """
+    Fetch commentary from the game details endpoint.
+    
+    Returns:
+        List of commentary entries with:
+        {
+            "minute": int,
+            "text": str,
+            "type": str,
+            "team": Optional[str],
+            "player": Optional[str],
+        }
+        Note: createdAt is added by the poller when forwarding.
+    """
+    data = fetch_game_details(game_id, away_id, home_id, competition_id)
+    
+    if not data or "game" not in data:
+        return []
+    
+    game = data.get("game", {})
+    raw_commentary = game.get("commentary", [])
+    
+    if not raw_commentary:
+        logger.debug(f"No commentary available for {game_id}")
+        return []
+    
+    commentary_list = []
+    for entry in raw_commentary:
+        # Extract minute from the entry
+        minute = entry.get("minute", 0)
+        if isinstance(minute, str):
+            try:
+                minute = int(minute)
+            except (ValueError, TypeError):
+                minute = 0
+        
+        # Determine event type
+        event_type = entry.get("type", "commentary")
+        
+        # Extract team and player info
+        team = None
+        if entry.get("team") and isinstance(entry.get("team"), dict):
+            team = entry.get("team", {}).get("name")
+        
+        player = None
+        if entry.get("player") and isinstance(entry.get("player"), dict):
+            player = entry.get("player", {}).get("name")
+        
+        commentary_list.append({
+            "minute": minute,
+            "text": entry.get("text", ""),
+            "type": event_type,
+            "team": team,
+            "player": player,
+        })
+    
+    logger.info(f"fetch_commentary({game_id}): Found {len(commentary_list)} entries")
+    return commentary_list
 
 
 def fetch_complete_match_data(
@@ -276,7 +359,7 @@ def fetch_complete_match_data(
     competition_id: int
 ) -> Optional[Dict[str, Any]]:
     """
-    Fetch all match data: details, lineups, and statistics in one go.
+    Fetch all match data: details, lineups, statistics, and commentary in one go.
     """
     data = fetch_game_details(game_id, away_id, home_id, competition_id)
     
@@ -297,18 +380,36 @@ def fetch_complete_match_data(
                 "possession": game.get("homePossession"),
                 "shots": game.get("homeShots"),
                 "shots_on_target": game.get("homeShotsOnTarget"),
+                "shots_off_target": game.get("homeShotsOffTarget"),
+                "corners": game.get("homeCorners"),
+                "fouls": game.get("homeFouls"),
+                "yellow_cards": game.get("homeYellowCards"),
+                "red_cards": game.get("homeRedCards"),
+                "offsides": game.get("homeOffsides"),
+                "passes": game.get("homePasses"),
+                "pass_accuracy": game.get("homePassAccuracy"),
             },
             "away": {
                 "possession": game.get("awayPossession"),
                 "shots": game.get("awayShots"),
                 "shots_on_target": game.get("awayShotsOnTarget"),
+                "shots_off_target": game.get("awayShotsOffTarget"),
+                "corners": game.get("awayCorners"),
+                "fouls": game.get("awayFouls"),
+                "yellow_cards": game.get("awayYellowCards"),
+                "red_cards": game.get("awayRedCards"),
+                "offsides": game.get("awayOffsides"),
+                "passes": game.get("awayPasses"),
+                "pass_accuracy": game.get("awayPassAccuracy"),
             },
             "minute": game.get("gameTime", 0)
         },
+        "commentary": game.get("commentary", []),
         "score": {
             "home": game.get("homeCompetitor", {}).get("score", 0),
             "away": game.get("awayCompetitor", {}).get("score", 0),
         },
         "status": game.get("statusText"),
         "time_elapsed": game.get("gameTime", 0),
+        "is_finished": is_game_finished(game),
     }
