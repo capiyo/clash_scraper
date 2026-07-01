@@ -4,7 +4,6 @@ Live poller for World Cup matches with full state machine.
 Handles: upcoming → soon → live → completed → archived
 Fetches lineups when matches are in "soon" state (40-60 mins before kickoff)
 """
-
 from __future__ import annotations
 
 import logging
@@ -12,7 +11,7 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 from dotenv import load_dotenv
 
@@ -123,8 +122,7 @@ LINEUP_EARLY_THRESHOLD = 60
 LINEUP_LATE_THRESHOLD = 40
 STATS_THRESHOLD_MINUTES = 10
 
-# Flashscore name->ID resolution: rebuild the in-memory schedule map at
-# most this often.
+# Flashscore name->ID resolution
 FLASHSCORE_MAP_TTL_SECONDS = 6 * 3600
 FLASHSCORE_MAX_RESOLVE_ATTEMPTS = 5
 
@@ -324,6 +322,18 @@ class Poller:
         self._flashscore_map_built_at: float = 0.0
         self._last_archive_check: float = 0.0
 
+    def _format_timestamp(self, ts) -> str:
+        """Format timestamp for Rust DateTime<Utc> - MUST include timezone"""
+        if ts is None:
+            return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+        if isinstance(ts, datetime):
+            return ts.isoformat().replace('+00:00', 'Z')
+        if isinstance(ts, str):
+            if not ts.endswith('Z') and '+' not in ts:
+                return ts + 'Z'
+            return ts
+        return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+
     def start(self):
         """Start polling loop."""
         self.running = True
@@ -405,16 +415,21 @@ class Poller:
             logger.info(f"📊 {match_id}: {current_status} → {new_status}")
             self.store.update_status(match_id, new_status)
 
+            # Get current scores
+            home_score = int(match.get("homeScore") or match.get("home_score") or 0)
+            away_score = int(match.get("awayScore") or match.get("away_score") or 0)
+
             self.forwarder.forward_live_update(
                 {
                     "fixture_id": match_id,
                     "event_type": "status_change",
+                    "home_score": home_score,
+                    "away_score": away_score,
+                    "minute": 0,
                     "status": new_status,
                     "is_live": new_status == "live",
                     "available_for_voting": new_status in ["upcoming", "soon"],
-                    "minute": 0,
-                    "home_score": match.get("homeScore") or match.get("home_score", 0),
-                    "away_score": match.get("awayScore") or match.get("away_score", 0),
+                    "timestamp": self._format_timestamp(None),
                 }
             )
 
@@ -485,7 +500,10 @@ class Poller:
             )
 
     def _fetch_commentary(self, match: Dict[str, Any]):
-        """Fetch live commentary from Flashscore."""
+        """
+        Fetch live commentary from Flashscore.
+        Entries are formatted to match Rust CommentaryEntry EXACTLY.
+        """
         match_id = match.get("matchId")
         flashscore_id = match.get("flashscore_id") or self.store.get_flashscore_id(match_id)
 
@@ -500,14 +518,16 @@ class Poller:
                 logger.info(f"📝 Got {len(commentary)} Flashscore commentary entries for {match_id}")
 
                 for entry in commentary:
-                    # Ensure entry has correct format for Rust API
+                    # ✅ FIXED: Match Rust CommentaryEntry EXACTLY
                     formatted_entry = {
-                        "minute": entry.get("minute", 0),
-                        "text": entry.get("text", ""),
-                        "event_type": entry.get("type") or entry.get("event_type", "general"),
+                        "minute": int(entry.get("minute", 0)),
+                        "text": str(entry.get("text", "")),
+                        "type": entry.get("type") or entry.get("event_type") or "general",
                         "team": entry.get("team"),
                         "player": entry.get("player"),
-                        "created_at": entry.get("created_at") or entry.get("createdAt") or datetime.now(timezone.utc).isoformat(),
+                        "createdAt": self._format_timestamp(
+                            entry.get("createdAt") or entry.get("created_at")
+                        ),
                     }
                     self.forwarder.forward_commentary(
                         {
@@ -581,7 +601,7 @@ class Poller:
         )
 
         if stats:
-            minute = stats.get("minute", 0)
+            minute = int(stats.get("minute", 0))
             stats_data = {
                 "home": stats.get("home", {}),
                 "away": stats.get("away", {}),
@@ -596,7 +616,10 @@ class Poller:
             logger.debug(f"📊 Statistics forwarded for {match_id} at {minute}'")
 
     def _fetch_live_updates(self, match: Dict[str, Any]):
-        """Fetch live updates (scores, events, commentary)."""
+        """
+        Fetch live updates (scores, events, commentary).
+        ALL fields match Rust LiveGameUpdate EXACTLY.
+        """
         match_id = match.get("matchId")
         game_id = match.get("threesixtyfiveGameId")
         away_id = match.get("away_competitor_id")
@@ -620,6 +643,7 @@ class Poller:
         home_comp = game.get("homeCompetitor", {})
         away_comp = game.get("awayCompetitor", {})
 
+        # ENSURE ALL ARE INT
         raw_home_score = home_comp.get("score")
         raw_away_score = away_comp.get("score")
         home_score = int(raw_home_score) if raw_home_score is not None else 0
@@ -634,9 +658,9 @@ class Poller:
             self._finalize_match_result(match)
             return
 
-        minute = game.get("gameTime", 0)
+        minute = int(game.get("gameTime", 0))
 
-        # ✅ FIXED: Match Rust LiveGameUpdate struct exactly
+        # ✅ FIXED: Match Rust LiveGameUpdate EXACTLY
         live_update = {
             "fixture_id": match_id,
             "event_type": "live_update",
@@ -647,16 +671,15 @@ class Poller:
             "status": "live",
             "is_live": True,
             "available_for_voting": False,
-            "scorer": None,
-            "player": None,
-            "assist": None,
-            "team": None,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": self._format_timestamp(None),
         }
         self.forwarder.forward_live_update(live_update)
 
     def _finalize_match_result(self, match: Dict[str, Any]):
-        """Finalize match result and notify Rust API."""
+        """
+        Finalize match result and notify Rust API.
+        Rust expects only fixture_id and result.
+        """
         match_id = match.get("matchId")
 
         game = self.store.get_fixture(match_id)
@@ -664,8 +687,8 @@ class Poller:
             logger.warning(f"{match_id}: Cannot finalize - match not found")
             return
 
-        home_score = game.get("home_score", 0)
-        away_score = game.get("away_score", 0)
+        home_score = game.get("homeScore") or game.get("home_score") or 0
+        away_score = game.get("awayScore") or game.get("away_score") or 0
 
         if home_score > away_score:
             result = "home"
@@ -674,11 +697,10 @@ class Poller:
         else:
             result = "draw"
 
+        # ✅ FIXED: Only send fixture_id and result
         finalize_payload = {
             "fixture_id": match_id,
             "result": result,
-            "home_score": home_score,
-            "away_score": away_score,
         }
 
         success = self.forwarder.finalize_match(finalize_payload)
