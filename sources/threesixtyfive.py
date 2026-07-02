@@ -337,8 +337,22 @@ def fetch_commentary(
     competition_id: int
 ) -> List[Dict[str, Any]]:
     """
-    Fetch commentary from the game details endpoint.
-    
+    Fetch commentary via 365Scores' separate play-by-play feed
+    (pbpgenerator.365scores.com). The /web/game/ endpoint does NOT embed
+    commentary text directly -- game.commentary is not a real field. It
+    only returns game.playByPlay.feedURL, a pointer to this separate feed.
+
+    Two things the raw feed gets wrong that we correct here:
+      1. The feedURL 365Scores returns comes pre-built with lang=37
+         (Dutch), not English -- every other endpoint in this file uses
+         langId=1, so we force lang=1 here too before fetching.
+      2. Entry field names are PascalCase (.NET-style): Comment, Timeline,
+         Type, TypeName, Period, Title, IsMajor, Players -- not the
+         lowercase minute/text/type/team/player shape used elsewhere.
+         Kickoff / half-end markers have no "Comment" field -- they use
+         "Title" instead (e.g. "Rust 0-0" / half-time score) -- so we
+         fall back to Title.
+
     Returns:
         List of commentary entries with:
         {
@@ -351,47 +365,68 @@ def fetch_commentary(
         Note: createdAt is added by the poller when forwarding.
     """
     data = fetch_game_details(game_id, away_id, home_id, competition_id)
-    
+
     if not data or "game" not in data:
         return []
-    
+
     game = data.get("game", {})
-    raw_commentary = game.get("commentary", [])
-    
-    if not raw_commentary:
-        logger.debug(f"No commentary available for {game_id}")
+    pbp = game.get("playByPlay") or {}
+    feed_url = pbp.get("feedURL")
+
+    if not feed_url:
+        logger.debug(f"No playByPlay feedURL for {game_id}")
         return []
-    
+
+    # Force English -- 365Scores returns lang=37 (Dutch) by default here.
+    feed_url = re.sub(r"lang=\d+", "lang=1", feed_url)
+
+    try:
+        response = requests.get(feed_url, headers=DEFAULT_HEADERS, timeout=30)
+        response.raise_for_status()
+        raw = response.json()
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to fetch play-by-play feed for {game_id}: {e}")
+        return []
+    except ValueError as e:
+        logger.error(f"Failed to parse play-by-play JSON for {game_id}: {e}")
+        return []
+
+    # We don't rely on knowing the exact wrapper key name -- find the
+    # first top-level list of dicts in the response instead.
+    raw_commentary = []
+    if isinstance(raw, list):
+        raw_commentary = raw
+    elif isinstance(raw, dict):
+        for value in raw.values():
+            if isinstance(value, list) and value and isinstance(value[0], dict):
+                raw_commentary = value
+                break
+
+    if not raw_commentary:
+        logger.debug(f"No commentary entries in play-by-play feed for {game_id}")
+        return []
+
     commentary_list = []
     for entry in raw_commentary:
-        # Extract minute from the entry
-        minute = entry.get("minute", 0)
-        if isinstance(minute, str):
-            try:
-                minute = int(minute)
-            except (ValueError, TypeError):
-                minute = 0
-        
-        # Determine event type
-        event_type = entry.get("type", "commentary")
-        
-        # Extract team and player info
-        team = None
-        if entry.get("team") and isinstance(entry.get("team"), dict):
-            team = entry.get("team", {}).get("name")
-        
-        player = None
-        if entry.get("player") and isinstance(entry.get("player"), dict):
-            player = entry.get("player", {}).get("name")
-        
+        minute_raw = entry.get("Timeline")
+        try:
+            minute = int(minute_raw) if minute_raw is not None else 0
+        except (ValueError, TypeError):
+            minute = 0
+
+        text = entry.get("Comment") or entry.get("Title") or ""
+
+        players = entry.get("Players") or []
+        player = players[0].get("PlayerName") if players else None
+
         commentary_list.append({
             "minute": minute,
-            "text": entry.get("text", ""),
-            "type": event_type,
-            "team": team,
+            "text": text,
+            "type": entry.get("TypeName", "commentary"),
+            "team": None,  # not directly present -- CompetitorNum(1/2) could be mapped to team name if needed later
             "player": player,
         })
-    
+
     logger.info(f"fetch_commentary({game_id}): Found {len(commentary_list)} entries")
     return commentary_list
 
