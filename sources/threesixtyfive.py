@@ -236,24 +236,47 @@ def fetch_lineups(
     return result
 
 
-def fetch_statistics(
-    game_id: str,
-    away_id: int,
-    home_id: int,
-    competition_id: int
-) -> Optional[Dict[str, Any]]:
+import re
+
+# All keywords are matched with regex word boundaries (\b), never plain
+# substring containment -- naive "in" checks cause false positives like
+# "pen" matching inside "suspended", or "ended" matching inside
+# "suspended" too. \b works fine for multi-word phrases like "half time"
+# since spaces are already non-word characters.
+HALFTIME_STATUS_KEYWORDS = ("ht", "half time", "halftime")
+STOPPED_STATUS_KEYWORDS = ("stopped", "suspended", "interrupted", "delayed", "abandoned")
+FULLTIME_STATUS_KEYWORDS = ("ft", "aet", "pen", "ended", "finished", "full-time", "full time", "penalties")
+
+
+def _matches(text: str, keywords: tuple) -> bool:
+    return any(re.search(r"\b" + re.escape(kw) + r"\b", text) for kw in keywords)
+
+
+def classify_match_phase(status_text: Optional[str]) -> Optional[str]:
     """
-    Fetch statistics from the game details endpoint.
+    Classify a 365Scores statusText into one of the three moments we care
+    about for statistics snapshots: "halftime", "stopped", "fulltime".
+    Returns None if the match is in open play (or status is unknown).
     """
-    data = fetch_game_details(game_id, away_id, home_id, competition_id)
-    
-    if not data or "game" not in data:
+    text = (status_text or "").strip().lower()
+    if not text:
         return None
-    
-    game = data.get("game", {})
-    
-    # Statistics are in the game object
-    stats = {
+    if _matches(text, FULLTIME_STATUS_KEYWORDS):
+        return "fulltime"
+    if _matches(text, HALFTIME_STATUS_KEYWORDS):
+        return "halftime"
+    if _matches(text, STOPPED_STATUS_KEYWORDS):
+        return "stopped"
+    return None
+
+
+def extract_statistics_from_game(game: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build the statistics payload from an already-fetched `game` object.
+    Lets callers that already hold a `game` dict (e.g. the poller's live
+    loop) skip a redundant fetch_game_details() call.
+    """
+    return {
         "home": {
             "possession": game.get("homePossession"),
             "shots": game.get("homeShots"),
@@ -280,10 +303,31 @@ def fetch_statistics(
             "passes": game.get("awayPasses"),
             "pass_accuracy": game.get("awayPassAccuracy"),
         },
-        "minute": game.get("gameTime", 0)
+        "minute": game.get("gameTime", 0),
+        "status_text": game.get("statusText"),
     }
+
+
+def fetch_statistics(
+    game_id: str,
+    away_id: int,
+    home_id: int,
+    competition_id: int
+) -> Optional[Dict[str, Any]]:
+    """
+    Fetch statistics from the game details endpoint.
+
+    NOTE: this makes its own fetch_game_details() call. If you already
+    have a `game` object on hand, prefer extract_statistics_from_game(game)
+    to avoid a redundant network request.
+    """
+    data = fetch_game_details(game_id, away_id, home_id, competition_id)
     
-    return stats
+    if not data or "game" not in data:
+        return None
+    
+    game = data.get("game", {})
+    return extract_statistics_from_game(game)
 
 
 def fetch_commentary(

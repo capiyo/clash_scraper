@@ -35,7 +35,6 @@ POLL_INTERVAL_UPCOMING = 300  # Every 5 minutes for upcoming matches
 SOON_THRESHOLD_MINUTES = 60  # 1 hour before kickoff = "soon"
 LINEUP_EARLY_THRESHOLD = 60  # Start checking at 60 mins before
 LINEUP_LATE_THRESHOLD = 40  # Stop checking at 40 mins before
-STATS_THRESHOLD_MINUTES = 10  # 10 minutes before kickoff = start stats
 
 
 class MatchStateMachine:
@@ -134,25 +133,24 @@ class MatchStateMachine:
 
         return False
 
-    def should_fetch_statistics(
-        self,
-        match: Dict[str, Any],
-        state: str,
-        minutes_to_kickoff: Optional[float] = None,
-    ) -> bool:
-        """Determine if we should fetch statistics."""
-        status = match.get("status", "")
+    def should_forward_statistics(self, match_id: str, phase: Optional[str]) -> bool:
+        """
+        Determine if we should store/forward a statistics snapshot.
 
-        if status not in ["live", "soon"]:
+        Statistics are only fetched/forwarded at three moments in a match:
+        halftime, stopped (suspended/interrupted play), and full-time.
+        `phase` is the result of threesixtyfive.classify_match_phase() on
+        the current statusText, computed from data we already fetched this
+        cycle (no extra network call). We forward at most once per
+        (match, phase) pair so a match sitting in "Half Time" for several
+        poll cycles doesn't spam duplicate snapshots.
+        """
+        if phase not in ("halftime", "stopped", "fulltime"):
             return False
+        return (match_id, phase) not in self.stats_started
 
-        if status == "live":
-            return True
-
-        if status == "soon" and minutes_to_kickoff is not None:
-            return minutes_to_kickoff <= STATS_THRESHOLD_MINUTES
-
-        return False
+    def mark_stats_forwarded(self, match_id: str, phase: str):
+        self.stats_started.add((match_id, phase))
 
     def should_update_status(self, match: Dict[str, Any]) -> Optional[str]:
         """Determine if match status should be updated."""
@@ -207,9 +205,6 @@ class MatchStateMachine:
 
     def mark_lineups_done(self, match_id: str):
         self.lineups_fetched.add(match_id)
-
-    def mark_stats_started(self, match_id: str):
-        self.stats_started.add(match_id)
 
     def mark_completed_notified(self, match_id: str):
         self.completed_notified.add(match_id)
@@ -307,11 +302,10 @@ class Poller:
             self._fetch_and_forward_lineups(match)
             self.state_machine.mark_lineups_done(match_id)
 
-        # --- STEP 3: FETCH STATISTICS (if live or soon near kickoff) ---
-        if self.state_machine.should_fetch_statistics(match, current_status, minutes_to_kickoff):
-            self._fetch_and_forward_statistics(match)
-
-        # --- STEP 4: FETCH LIVE UPDATES (if live) ---
+        # --- STEP 3: FETCH LIVE UPDATES (if live) ---
+        # Statistics are fetched/forwarded from inside _fetch_live_updates,
+        # but ONLY at halftime, stopped/suspended play, and full-time --
+        # not on every 15s live tick. See should_forward_statistics().
         if current_status == "live":
             self._fetch_live_updates(match)
 
@@ -466,23 +460,37 @@ class Poller:
         except Exception as e:
             logger.error(f"❌ Failed to fetch lineups for {match_id}: {e}")
 
-    def _fetch_and_forward_statistics(self, match: Dict[str, Any]):
-        """Fetch statistics and forward to Rust API."""
+    def _fetch_and_forward_statistics(
+        self,
+        match: Dict[str, Any],
+        game: Optional[Dict[str, Any]] = None,
+    ):
+        """
+        Store + forward a statistics snapshot.
+
+        Only ever called at halftime, during a stoppage, or at full-time
+        (see should_forward_statistics() / classify_match_phase()) -- not
+        on every live tick. If `game` (from this cycle's already-fetched
+        fetch_game_details() response) is supplied, it's reused directly
+        instead of making a second network request.
+        """
         match_id = match.get("matchId")
         game_id = match.get("threesixtyfiveGameId")
         away_id = match.get("away_competitor_id")
         home_id = match.get("home_competitor_id")
         competition_id = match.get("competition_id", 5930)
 
-        if not all([game_id, away_id, home_id]):
-            return
-
-        stats = threesixtyfive.fetch_statistics(
-            game_id=game_id,
-            away_id=away_id,
-            home_id=home_id,
-            competition_id=competition_id,
-        )
+        if game is not None:
+            stats = threesixtyfive.extract_statistics_from_game(game)
+        else:
+            if not all([game_id, away_id, home_id]):
+                return
+            stats = threesixtyfive.fetch_statistics(
+                game_id=game_id,
+                away_id=away_id,
+                home_id=home_id,
+                competition_id=competition_id,
+            )
 
         if stats:
             minute = stats.get("minute", 0)
@@ -551,9 +559,20 @@ class Poller:
                 f"({home_score}-{away_score}), match hasn't started scoring yet"
             )
 
+        # Classify the match phase from statusText, and fetch/forward
+        # statistics ONLY at halftime, during a stoppage, or at full-time --
+        # never on a normal in-play tick. We reuse the `game` object from
+        # the fetch_game_details() call above, so this costs no extra
+        # network request.
+        raw_status_text = game.get("statusText")
+        phase = threesixtyfive.classify_match_phase(raw_status_text)
+        if self.state_machine.should_forward_statistics(match_id, phase):
+            logger.info(f"📊 {match_id}: phase={phase} ({raw_status_text!r}) - fetching statistics")
+            self._fetch_and_forward_statistics(match, game=game)
+            self.state_machine.mark_stats_forwarded(match_id, phase)
+
         # Check if match ended
-        status_text = (game.get("statusText") or "").strip().lower()
-        if status_text in ("finished", "ft", "ended", "full-time", "aet", "pen"):
+        if phase == "fulltime":
             self.store.update_status(match_id, "completed")
             self._finalize_match_result(match)
             return
