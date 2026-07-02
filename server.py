@@ -1,5 +1,5 @@
 """
-Web server to keep the Render service alive and trigger poller via /poll endpoint.
+Web server to keep the Render service alive.
 """
 from flask import Flask, jsonify
 import subprocess
@@ -20,7 +20,7 @@ def home():
         "status": "running",
         "service": "World Cup Poller",
         "endpoints": {
-            "/poll": "Trigger the poller to check matches",
+           
             "/scrape": "Trigger the scraper to fetch fixtures",
             "/health": "Health check"
         }
@@ -30,41 +30,6 @@ def home():
 def health():
     return jsonify({"status": "healthy"})
 
-@app.route('/poll')
-def trigger_poller():
-    """Run the poller in the background and stream logs."""
-    def run_poller():
-        try:
-            logger.info("🚀 Poller triggered via /poll endpoint")
-            
-            # Run poller and stream output in real-time
-            process = subprocess.Popen(
-                [sys.executable, 'poller.py'],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1  # Line buffered
-            )
-            
-            # Read and log each line as it comes
-            for line in process.stdout:
-                logger.info(f"📤 {line.strip()}")
-            
-            # Wait for process to complete
-            process.wait()
-            logger.info(f"✅ Poller finished with code: {process.returncode}")
-            
-        except Exception as e:
-            logger.error(f"❌ Poller failed: {e}")
-    
-    thread = threading.Thread(target=run_poller)
-    thread.start()
-    
-    return jsonify({
-        "status": "started",
-        "message": "Poller triggered in background",
-        "endpoint": "/poll"
-    })
 
 @app.route('/scrape')
 def trigger_scraper():
