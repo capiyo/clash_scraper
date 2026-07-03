@@ -443,9 +443,18 @@ class Poller:
                     "lineups": lineups_shaped,
                 }
 
-                # Store in MongoDB (store the shaped lineups so what's in
-                # Mongo matches what was actually forwarded)
-                self.store.store_lineups(match_id, lineups_shaped)
+                # NOTE: deliberately NOT writing lineups_shaped to Mongo
+                # directly here anymore. A raw self.store.store_lineups()
+                # write bypasses Rust's typed LineupsDocument builder
+                # (which adds matchId, homeTeam, awayTeam, and fetchedAt
+                # at the embedded-document level). When that raw shape
+                # persisted instead of being reliably overwritten by the
+                # HTTP path below, it corrupted fixtures.lineups with a
+                # document missing 'matchId', which crashed EVERY /live
+                # and /upcoming fetch for that fixture (see wc26_4749268
+                # incident, 2026-07-03). The only correct writer of
+                # fixtures.lineups is now Rust's store_lineups() handler,
+                # reached via forward_lineups() below.
 
                 # Forward to Rust API
                 success = self.forwarder.forward_lineups(lineups_payload)
@@ -493,7 +502,12 @@ class Poller:
             )
 
         if stats:
-            minute = stats.get("minute", 0)
+            # Defensive int() cast here too -- even though
+            # threesixtyfive.py now casts gameTime to int at the source,
+            # this direct MongoDB write bypasses forwarder.py's own
+            # int() cast, so a future upstream float would otherwise
+            # corrupt fixtures.statistics again (see wc26_4749268 incident).
+            minute = int(stats.get("minute", 0) or 0)
             team_stats = {"home": stats.get("home", {}), "away": stats.get("away", {})}
 
             self.store.add_statistics_snapshot(match_id, team_stats, minute)

@@ -1,4 +1,3 @@
-
 """
 MongoDB access for the poller. Field names match the Rust Game struct
 EXACTLY (camelCase, per each #[serde(rename = "...")]) -- this was
@@ -387,6 +386,15 @@ class FixtureStore:
 
         CAUTION: see note above -- prefer forwarding to the Rust
         /games/statistics endpoint over writing this field directly."""
+        # Defensive int() cast at the actual write boundary. Rust's
+        # StatisticsSnapshot.minute is a strict i32 -- a float here (e.g.
+        # 365Scores' gameTime returning 45.0 at halftime) gets stored as
+        # a BSON double and crashes every subsequent /games/live and
+        # /games/upcoming deserialization for this fixture with
+        # "invalid type: floating point, expected i32" (see wc26_4749268
+        # incident, 2026-07-03). Cast here too, not just at the caller,
+        # so this method is safe no matter what calls it in the future.
+        minute = int(minute or 0)
         snapshot = {
             "minute": minute,
             "statistics": stats,

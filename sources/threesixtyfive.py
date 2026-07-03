@@ -303,7 +303,7 @@ def extract_statistics_from_game(game: Dict[str, Any]) -> Dict[str, Any]:
             "passes": game.get("awayPasses"),
             "pass_accuracy": game.get("awayPassAccuracy"),
         },
-        "minute": game.get("gameTime", 0),
+        "minute": int(game.get("gameTime", 0) or 0),
         "status_text": game.get("statusText"),
     }
 
@@ -481,7 +481,7 @@ def fetch_complete_match_data(
                 "passes": game.get("awayPasses"),
                 "pass_accuracy": game.get("awayPassAccuracy"),
             },
-            "minute": game.get("gameTime", 0)
+            "minute": int(game.get("gameTime", 0) or 0)
         },
         "commentary": game.get("commentary", []),
         "score": {
@@ -489,6 +489,6 @@ def fetch_complete_match_data(
             "away": game.get("awayCompetitor", {}).get("score", 0),
         },
         "status": game.get("statusText"),
-        "time_elapsed": game.get("gameTime", 0),
+        "time_elapsed": int(game.get("gameTime", 0) or 0),
         "is_finished": is_game_finished(game),
     }
