@@ -29,15 +29,19 @@ WORLD_CUP_COMPETITION_IDS: list[int] = [5930]
 SCRAPE_DAYS_AHEAD = 7
 
 
+import re
+
 def _status_to_internal(status_text: str) -> str:
     text = (status_text or "").strip().lower()
     if text in ("finished", "ft", "ended", "full-time", "aet", "pen"):
         return "completed"
-    live_markers = ("live", "1st half", "2nd half", "ht", "halftime", "in progress")
-    if any(m in text for m in live_markers):
+    
+    # Word-boundary matching prevents "Live" in "Live Lineups" from matching
+    live_patterns = (r"\blive\b", r"\b1st half\b", r"\b2nd half\b", r"\bht\b", r"\bhalftime\b", r"\bin progress\b")
+    if any(re.search(pattern, text) for pattern in live_patterns):
         return "live"
-    return "upcoming"  # safe default
-
+    
+    return "upcoming"
 
 def _parse_kickoff(start_time_raw: str | None) -> datetime.datetime:
     now = datetime.datetime.now(datetime.timezone.utc)
