@@ -216,18 +216,78 @@ class Forwarder:
 
     def forward_lineups(self, lineups: Dict[str, Any]) -> bool:
         """
-        Rust expects LineupsUpdate with camelCase fields.
+        Rust expects LineupsUpdate with camelCase fields, and each player
+        inside lineups.home/away.players/bench must match Rust's
+        PlayerPayload exactly: name (str), position (str -- NOT an
+        object), jerseyNumber (int), captain (bool), lineup (str:
+        "starting"/"bench"), playerId (str, optional).
+
+        threesixtyfive.fetch_lineups() hands us raw 365Scores "members"
+        entries here (status, statusText, position: {...object...},
+        ranking, competitorId, id, name, shortName, athleteId). Those do
+        NOT match PlayerPayload's shape -- forwarding them unmodified
+        causes axum to reject the whole POST (position isn't a string),
+        which silently drops lineups for the match, and previously
+        (before this fix) let a stale/malformed shape get written to
+        Mongo directly and crash every read of that fixture (see
+        wc26_4749268 incident, 2026-07-03). clean_player() below maps
+        the raw member shape into PlayerPayload's shape instead of
+        passing it through.
         """
         lineups_data = lineups.get("lineups", {})
-        
+
+        def clean_player(member: Dict[str, Any]) -> Dict[str, Any]:
+            # TODO: confirm these key names against a full raw 365Scores
+            # member object (the ones we've inspected show only 9 of 11
+            # fields expanded) -- jerseyNumber/captain in particular may
+            # live under different keys than guessed here.
+            position = member.get("position")
+            position_name = (
+                position.get("name") or position.get("shortName")
+                if isinstance(position, dict)
+                else position
+            ) or ""
+
+            jersey_number = (
+                member.get("jerseyNumber")
+                or member.get("shirtNumber")
+                or member.get("num")
+                or 0
+            )
+
+            captain = bool(
+                member.get("captain")
+                or member.get("isCaptain")
+                or member.get("captainFlag")
+            )
+
+            player_id = member.get("id") or member.get("playerId")
+
+            return {
+                "name": member.get("name") or member.get("shortName") or "Unknown",
+                "position": position_name,
+                "jerseyNumber": jersey_number,
+                "captain": captain,
+                "lineup": "starting" if member.get("status") == 1 else "bench",
+                "playerId": str(player_id) if player_id is not None else None,
+            }
+
         def clean_team(data):
+            members = data.get("players") or data.get("members") or []
+            starting = [clean_player(m) for m in members if m.get("status") == 1]
+            bench = [clean_player(m) for m in members if m.get("status") != 1]
+            # Some callers may already pass a pre-split "bench" list
+            # (e.g. local/back-compat paths) -- fold those in too rather
+            # than dropping them.
+            bench.extend(clean_player(m) for m in data.get("bench", []))
+
             return {
                 "formation": data.get("formation", "4-4-2"),
                 "coach": {"name": data.get("coach", {}).get("name", "Unknown")},
-                "players": data.get("players", []),
-                "bench": data.get("bench", []),
+                "players": starting,
+                "bench": bench,
             }
-        
+
         payload = self._clean({
             "fixtureId": lineups.get("fixture_id"),
             "homeTeam": lineups.get("home_team"),
