@@ -124,38 +124,34 @@ class Forwarder:
         return self._post("/games/live-update", payload)
 
     # ============================================================
-    # COMMENTARY - MATCHES RUST CommentaryUpdate
+    # COMMENTARY - MATCHES RUST CommentaryUpdate / CommentaryBulkUpdate
     # ============================================================
 
-    def forward_commentary(self, commentary: Dict[str, Any]) -> bool:
+    def _normalize_commentary_entry(self, entry: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Forward commentary to Rust API.
-        Rust expects CommentaryUpdate with:
-        - match_id: String
-        - entry: CommentaryEntry with:
+        Shared normalization for a single commentary entry -> Rust
+        CommentaryEntry shape:
             - minute: i32
             - text: String
             - type: String (NOT event_type)
             - team: Option<String>
             - player: Option<String>
-            - createdAt: BsonDateTime (with milliseconds and timezone)
+            - createdAt: BsonDateTime (string, with milliseconds and timezone)
+
+        Used by BOTH the singular (forward_commentary) and bulk
+        (forward_commentary_bulk) paths so they can never drift out of
+        sync with each other -- previously forward_commentary_bulk sent
+        raw, unnormalized entries straight through, which is what let
+        commentary silently fail to broadcast over WebSocket even though
+        it was landing in MongoDB via the poller's direct store write.
         """
-        entry = commentary.get("entry", {})
-        match_id = commentary.get("match_id")
-        
-        if not match_id:
-            logger.error("Missing match_id in commentary")
-            return False
-        
-        # Ensure minute is int
         try:
             minute = int(entry.get("minute", 0))
         except (ValueError, TypeError):
             minute = 0
-        
-        # Ensure text is string
+
         text = str(entry.get("text", ""))
-        
+
         # Ensure type is correct (use "type" field, fallback to "event_type")
         event_type = entry.get("type")
         if not event_type:
@@ -163,27 +159,73 @@ class Forwarder:
         if not event_type:
             event_type = "commentary"
         event_type = str(event_type)
-        
+
         # Format timestamp for BsonDateTime - with milliseconds and timezone
         created_at = entry.get("createdAt")
         if not created_at:
             created_at = entry.get("created_at")
         created_at = self._format_timestamp(created_at)
-        
+
+        return self._clean({
+            "minute": minute,
+            "text": text,
+            "type": event_type,
+            "team": entry.get("team"),
+            "player": entry.get("player"),
+            "createdAt": created_at,
+        })
+
+    def forward_commentary(self, commentary: Dict[str, Any]) -> bool:
+        """
+        Forward a single commentary entry to Rust API.
+        Rust expects CommentaryUpdate with:
+        - match_id: String
+        - entry: CommentaryEntry (see _normalize_commentary_entry)
+        """
+        entry = commentary.get("entry", {})
+        match_id = commentary.get("match_id")
+
+        if not match_id:
+            logger.error("Missing match_id in commentary")
+            return False
+
         payload = {
             "match_id": str(match_id),
-            "entry": self._clean({
-                "minute": minute,
-                "text": text,
-                "type": event_type,
-                "team": entry.get("team"),
-                "player": entry.get("player"),
-                "createdAt": created_at,
-            })
+            "entry": self._normalize_commentary_entry(entry),
         }
-        
+
         logger.debug(f"📤 Commentary payload: {payload}")
         return self._post("/games/commentary", payload)
+
+    def forward_commentary_bulk(self, fixture_id: str, entries: List[Dict[str, Any]]) -> bool:
+        """
+        Forward a batch of commentary entries in a single request.
+        Rust expects CommentaryBulkUpdate with:
+        - match_id: String
+        - entries: Vec<CommentaryEntry> (each normalized the same way
+          as the singular path -- see _normalize_commentary_entry)
+
+        POSTs to /games/commentary/bulk, which stores all entries in one
+        $push/$each and fires a single "commentary.bulk" WebSocket
+        broadcast for the whole batch, rather than one broadcast per
+        entry.
+        """
+        if not fixture_id:
+            logger.error("Missing fixture_id in bulk commentary")
+            return False
+        if not entries:
+            return True
+
+        normalized = [self._normalize_commentary_entry(e) for e in entries]
+        payload = {
+            "match_id": str(fixture_id),
+            "entries": normalized,
+        }
+
+        logger.debug(
+            f"📤 Bulk commentary payload: {len(normalized)} entries for {fixture_id}"
+        )
+        return self._post("/games/commentary/bulk", payload)
 
     # ============================================================
     # STATISTICS - MATCHES RUST StatisticsSnapshotPayload
@@ -370,13 +412,6 @@ class Forwarder:
             "awayScore": int(event.get("away_score", 0)),
         })
         return self._post("/games/events", payload)
-
-    def forward_commentary_bulk(self, fixture_id: str, entries: List[Dict[str, Any]]) -> bool:
-        payload = {
-            "match_id": fixture_id,
-            "entries": entries
-        }
-        return self._post("/games/commentary/bulk", payload)
 
     def forward_notification(self, notification: Dict[str, Any]) -> bool:
         payload = self._clean({
