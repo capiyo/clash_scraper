@@ -1,5 +1,5 @@
 """
-Live poller for World Cup matches with full state machine.
+Live poller for World Cup matches with full state machine and triple-verification.
 Handles: upcoming → soon → live → completed → archived
 Fetches lineups when matches are in "soon" state (40-60 mins before kickoff)
 """
@@ -10,7 +10,7 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from dotenv import load_dotenv
 
@@ -27,14 +27,19 @@ logging.basicConfig(
 logger = logging.getLogger("worldcup_poller.poller")
 
 # Polling intervals (in seconds)
-POLL_INTERVAL_LIVE = 15  # Every 15 seconds for live matches
-POLL_INTERVAL_SOON = 60  # Every minute for soon matches
-POLL_INTERVAL_UPCOMING = 300  # Every 5 minutes for upcoming matches
+POLL_INTERVAL_LIVE = 15      # Every 15 seconds for live matches
+POLL_INTERVAL_SOON = 60      # Every minute for soon matches
+POLL_INTERVAL_UPCOMING = 300 # Every 5 minutes for upcoming matches
 
 # Time thresholds (in minutes before kickoff)
-SOON_THRESHOLD_MINUTES = 60  # 1 hour before kickoff = "soon"
-LINEUP_EARLY_THRESHOLD = 60  # Start checking at 60 mins before
-LINEUP_LATE_THRESHOLD = 40  # Stop checking at 40 mins before
+SOON_THRESHOLD_MINUTES = 60   # 1 hour before kickoff = "soon"
+LINEUP_EARLY_THRESHOLD = 60   # Start checking at 60 mins before
+LINEUP_LATE_THRESHOLD = 40    # Stop checking at 40 mins before
+
+# 365Scores status groups
+STATUS_GROUP_SCHEDULED = 2
+STATUS_GROUP_LIVE = 3
+STATUS_GROUP_FINISHED = 4
 
 
 class MatchStateMachine:
@@ -54,6 +59,7 @@ class MatchStateMachine:
         self.lineups_fetched = set()
         self.stats_started = set()
         self.completed_notified = set()
+        self._status_correction_logged = set()  # Prevent log spam
 
     def determine_state(self, match: Dict[str, Any]) -> str:
         """Determine the current state of a match based on kickoff time."""
@@ -79,8 +85,29 @@ class MatchStateMachine:
         status = match.get("status", "")
         if status == "completed":
             return "completed"
+
+        # ✅ DOUBLE-CHECK: If 365Scores says it's scheduled, force "soon" or "upcoming"
+        # This is the critical fix — we verify with the source of truth
         if status == "live":
-            return "live"
+            game_id = match.get("threesixtyfiveGameId")
+            if game_id:
+                try:
+                    details = threesixtyfive.fetch_game_details(
+                        game_id=game_id,
+                        away_id=match.get("away_competitor_id"),
+                        home_id=match.get("home_competitor_id"),
+                        competition_id=match.get("competition_id", 5930),
+                    )
+                    if details and details.get("game", {}).get("statusGroup") == STATUS_GROUP_SCHEDULED:
+                        # 365Scores says it's NOT live
+                        if minutes_until_kickoff > 0:
+                            logger.warning(
+                                f"⚠️ {match.get('matchId')}: 365Scores says scheduled but DB says live — "
+                                f"forcing 'soon' ({minutes_until_kickoff:.0f} mins to kickoff)"
+                            )
+                            return "soon"
+                except Exception as e:
+                    logger.debug(f"Could not verify live status with 365Scores: {e}")
 
         if minutes_until_kickoff <= 0:
             return "live"
@@ -119,10 +146,12 @@ class MatchStateMachine:
         if state == "completed":
             return False
 
+        # If match is already live and we missed lineups, fetch them
         if state == "live":
             logger.info(f"📋 {match_id}: Live but no lineups - fetching now")
             return True
 
+        # Normal flow: fetch in "soon" state within the window
         if state == "soon" and minutes_to_kickoff is not None:
             should_fetch = LINEUP_LATE_THRESHOLD <= minutes_to_kickoff <= LINEUP_EARLY_THRESHOLD
             if should_fetch:
@@ -139,11 +168,6 @@ class MatchStateMachine:
 
         Statistics are only fetched/forwarded at three moments in a match:
         halftime, stopped (suspended/interrupted play), and full-time.
-        `phase` is the result of threesixtyfive.classify_match_phase() on
-        the current statusText, computed from data we already fetched this
-        cycle (no extra network call). We forward at most once per
-        (match, phase) pair so a match sitting in "Half Time" for several
-        poll cycles doesn't spam duplicate snapshots.
         """
         if phase not in ("halftime", "stopped", "fulltime"):
             return False
@@ -153,30 +177,23 @@ class MatchStateMachine:
         self.stats_started.add((match_id, phase))
 
     def should_update_status(self, match: Dict[str, Any]) -> Optional[str]:
-        """Determine if match status should be updated."""
+        """
+        Determine if match status should be updated.
+        ✅ UPDATED: Now checks the state machine's computed state first.
+        """
         current_status = match.get("status", "upcoming")
-        kickoff_utc = match.get("kickoffUtc")
         minutes_to_kickoff = match.get("minutes_to_kickoff")
-
-        if not kickoff_utc:
-            return None
-
-        if isinstance(kickoff_utc, str):
-            try:
-                kickoff_utc = datetime.fromisoformat(kickoff_utc.replace("Z", "+00:00"))
-            except ValueError:
-                return None
-
-        if isinstance(kickoff_utc, datetime) and kickoff_utc.tzinfo is None:
-            kickoff_utc = kickoff_utc.replace(tzinfo=timezone.utc)
-
-        now = datetime.now(timezone.utc)
-
-        if minutes_to_kickoff is None and isinstance(kickoff_utc, datetime):
-            minutes_to_kickoff = (kickoff_utc - now).total_seconds() / 60
 
         if current_status == "completed":
             return None
+
+        # ✅ FIX: If the match is already "live" but minutes_to_kickoff > 0,
+        # we need to correct it
+        if current_status == "live" and minutes_to_kickoff is not None and minutes_to_kickoff > 0:
+            if minutes_to_kickoff <= SOON_THRESHOLD_MINUTES:
+                return "soon"
+            else:
+                return "upcoming"
 
         if minutes_to_kickoff is not None and minutes_to_kickoff <= 0 and current_status != "live":
             return "live"
@@ -189,19 +206,6 @@ class MatchStateMachine:
             return "soon"
 
         return None
-
-    def should_finalize_result(self, match: Dict[str, Any]) -> bool:
-        """Determine if we should finalize the match result."""
-        match_id = match.get("matchId")
-        status = match.get("status", "")
-
-        if status != "completed":
-            return False
-
-        if match_id in self.completed_notified:
-            return False
-
-        return True
 
     def mark_lineups_done(self, match_id: str):
         self.lineups_fetched.add(match_id)
@@ -244,6 +248,62 @@ class Poller:
         for match in all_fixtures:
             self._process_match(match)
 
+    def _verify_live_status_with_365scores(self, match: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+        """
+        ✅ NEW: Triple-verification — check with 365Scores if the match is actually live.
+        Returns (is_actually_live, status_text_or_phase)
+        """
+        match_id = match.get("matchId")
+        game_id = match.get("threesixtyfiveGameId")
+        away_id = match.get("away_competitor_id")
+        home_id = match.get("home_competitor_id")
+        competition_id = match.get("competition_id", 5930)
+
+        if not all([game_id, away_id, home_id]):
+            logger.debug(f"{match_id}: Missing IDs, cannot verify with 365Scores")
+            return False, None
+
+        try:
+            details = threesixtyfive.fetch_game_details(
+                game_id=game_id,
+                away_id=away_id,
+                home_id=home_id,
+                competition_id=competition_id,
+            )
+        except Exception as e:
+            logger.error(f"❌ Failed to verify live status for {match_id}: {e}")
+            return False, None
+
+        if not details or "game" not in details:
+            return False, None
+
+        game = details.get("game", {})
+        status_group = game.get("statusGroup")
+        status_text = game.get("statusText", "")
+
+        # 365Scores status groups:
+        # 2 = Scheduled (not started)
+        # 3 = Live (in progress)
+        # 4 = Finished
+        if status_group == STATUS_GROUP_LIVE:
+            logger.debug(f"{match_id}: 365Scores confirms LIVE (statusGroup=3, statusText='{status_text}')")
+            return True, status_text
+        elif status_group == STATUS_GROUP_SCHEDULED:
+            logger.debug(f"{match_id}: 365Scores says SCHEDULED (statusGroup=2, statusText='{status_text}')")
+            return False, status_text
+        elif status_group == STATUS_GROUP_FINISHED:
+            logger.debug(f"{match_id}: 365Scores says FINISHED (statusGroup=4)")
+            return False, "fulltime"
+        else:
+            # Unknown status group — check statusText for live markers
+            live_markers = ("1st half", "2nd half", "first half", "second half", "halftime", "ht", "live")
+            if any(marker in status_text.lower() for marker in live_markers):
+                logger.debug(f"{match_id}: 365Scores statusText suggests LIVE: '{status_text}'")
+                return True, status_text
+            else:
+                logger.debug(f"{match_id}: 365Scores statusText unknown: '{status_text}'")
+                return False, status_text
+
     def _process_match(self, match: Dict[str, Any]):
         """Process a single match based on its state."""
         match_id = match.get("matchId")
@@ -270,51 +330,198 @@ class Poller:
 
         match["minutes_to_kickoff"] = minutes_to_kickoff
 
-        # Determine current state
-        state = self.state_machine.determine_state(match)
-        current_status = match.get("status", "upcoming")
+        # ──────────────────────────────────────────────────────────────────────
+        # ✅ STEP 0: TRIPLE-VERIFICATION — Check with 365Scores for truth
+        # ──────────────────────────────────────────────────────────────────────
+        is_actually_live, status_text = self._verify_live_status_with_365scores(match)
 
-        # --- STEP 1: UPDATE STATUS IF NEEDED ---
-        new_status = self.state_machine.should_update_status(match)
-        if new_status and new_status != current_status:
-            logger.info(f"📊 {match_id}: {current_status} → {new_status}")
-            self.store.update_status(match_id, new_status)
-            self.forwarder.forward_live_update(
-                {
+        # If 365Scores says the match is NOT live, correct the status
+        if not is_actually_live and match.get("status") == "live":
+            if minutes_to_kickoff is not None and minutes_to_kickoff > 0:
+                new_status = "soon" if minutes_to_kickoff <= SOON_THRESHOLD_MINUTES else "upcoming"
+                logger.warning(
+                    f"⚠️ {match_id}: 365Scores says NOT LIVE (statusText='{status_text}') — "
+                    f"CORRECTING 'live' → '{new_status}' ({minutes_to_kickoff:.0f} mins to kickoff)"
+                )
+                self.store.update_status(match_id, new_status)
+                self.forwarder.forward_live_update({
                     "fixture_id": match_id,
                     "event_type": "status_change",
                     "status": new_status,
-                    "is_live": new_status == "live",
-                    "available_for_voting": new_status in ["upcoming", "soon"],
+                    "is_live": False,
+                    "available_for_voting": new_status in ("upcoming", "soon"),
                     "minutes_to_kickoff": minutes_to_kickoff,
-                }
-            )
+                })
+                match["status"] = new_status
+                # If we corrected to "soon", still fetch lineups
+                if new_status == "soon":
+                    self._fetch_and_forward_lineups(match)
+                return
+            else:
+                # minutes_to_kickoff is None or <= 0, but 365Scores says not live
+                # Force "soon" as a safety net
+                logger.warning(
+                    f"⚠️ {match_id}: 365Scores says NOT LIVE but minutes_to_kickoff={minutes_to_kickoff} — "
+                    f"FORCING 'soon' as safety net"
+                )
+                self.store.update_status(match_id, "soon")
+                self.forwarder.forward_live_update({
+                    "fixture_id": match_id,
+                    "event_type": "status_change",
+                    "status": "soon",
+                    "is_live": False,
+                    "available_for_voting": True,
+                })
+                match["status"] = "soon"
+                self._fetch_and_forward_lineups(match)
+                return
+
+        # ──────────────────────────────────────────────────────────────────────
+        # STEP 1: Determine state (with 365Scores verification baked in)
+        # ──────────────────────────────────────────────────────────────────────
+        state = self.state_machine.determine_state(match)
+        current_status = match.get("status", "upcoming")
+
+        # ──────────────────────────────────────────────────────────────────────
+        # STEP 2: UPDATE STATUS IF NEEDED (with safety checks)
+        # ──────────────────────────────────────────────────────────────────────
+        new_status = self.state_machine.should_update_status(match)
+
+        # ✅ SAFETY: If state machine says "soon" but DB says "live", force correction
+        if state == "soon" and current_status == "live":
+            if minutes_to_kickoff is not None and minutes_to_kickoff > 0:
+                logger.warning(
+                    f"⚠️ {match_id}: State machine says 'soon' but DB says 'live' — "
+                    f"CORRECTING ({minutes_to_kickoff:.0f} mins to kickoff)"
+                )
+                self.store.update_status(match_id, "soon")
+                self.forwarder.forward_live_update({
+                    "fixture_id": match_id,
+                    "event_type": "status_change",
+                    "status": "soon",
+                    "is_live": False,
+                    "available_for_voting": True,
+                    "minutes_to_kickoff": minutes_to_kickoff,
+                })
+                match["status"] = "soon"
+                current_status = "soon"
+                new_status = None  # Prevent further status updates this cycle
+
+        # ✅ SAFETY: If state machine says "upcoming" but DB says "soon" or "live"
+        if state == "upcoming" and current_status in ("soon", "live"):
+            if minutes_to_kickoff is not None and minutes_to_kickoff > SOON_THRESHOLD_MINUTES:
+                logger.warning(
+                    f"⚠️ {match_id}: State machine says 'upcoming' but DB says '{current_status}' — "
+                    f"CORRECTING ({minutes_to_kickoff:.0f} mins to kickoff)"
+                )
+                self.store.update_status(match_id, "upcoming")
+                self.forwarder.forward_live_update({
+                    "fixture_id": match_id,
+                    "event_type": "status_change",
+                    "status": "upcoming",
+                    "is_live": False,
+                    "available_for_voting": True,
+                    "minutes_to_kickoff": minutes_to_kickoff,
+                })
+                match["status"] = "upcoming"
+                current_status = "upcoming"
+                new_status = None
+
+        # Normal status transition
+        if new_status and new_status != current_status:
+            # ✅ SAFETY: Double-check with 365Scores before transitioning to "live"
+            if new_status == "live":
+                is_actually_live, _ = self._verify_live_status_with_365scores(match)
+                if not is_actually_live:
+                    logger.warning(
+                        f"⚠️ {match_id}: Refusing to transition to 'live' — 365Scores says NOT LIVE"
+                    )
+                    new_status = "soon"
+                    self.store.update_status(match_id, "soon")
+                    self.forwarder.forward_live_update({
+                        "fixture_id": match_id,
+                        "event_type": "status_change",
+                        "status": "soon",
+                        "is_live": False,
+                        "available_for_voting": True,
+                        "minutes_to_kickoff": minutes_to_kickoff,
+                    })
+                    match["status"] = "soon"
+                    current_status = "soon"
+                    # Still fetch lineups
+                    self._fetch_and_forward_lineups(match)
+                    return
+
+            logger.info(f"📊 {match_id}: {current_status} → {new_status}")
+            self.store.update_status(match_id, new_status)
+            self.forwarder.forward_live_update({
+                "fixture_id": match_id,
+                "event_type": "status_change",
+                "status": new_status,
+                "is_live": new_status == "live",
+                "available_for_voting": new_status in ["upcoming", "soon"],
+                "minutes_to_kickoff": minutes_to_kickoff,
+            })
+            match["status"] = new_status
+            current_status = new_status
+
             if new_status == "completed":
                 self._finalize_match_result(match)
                 return
             if new_status == "live":
                 self._notify_match_live(match)
-            match["status"] = new_status
-            current_status = new_status
 
-        # --- STEP 2: FETCH LINEUPS (if in soon state) ---
+        # ──────────────────────────────────────────────────────────────────────
+        # STEP 3: FETCH LINEUPS (if in soon state)
+        # ──────────────────────────────────────────────────────────────────────
         if self.state_machine.should_fetch_lineups(match, current_status, minutes_to_kickoff):
             self._fetch_and_forward_lineups(match)
             self.state_machine.mark_lineups_done(match_id)
 
-        # --- STEP 3: FETCH LIVE UPDATES (if live) ---
-        # Statistics are fetched/forwarded from inside _fetch_live_updates,
-        # but ONLY at halftime, stopped/suspended play, and full-time --
-        # not on every 15s live tick. See should_forward_statistics().
+        # ──────────────────────────────────────────────────────────────────────
+        # STEP 4: FETCH LIVE UPDATES (if live — with verification)
+        # ──────────────────────────────────────────────────────────────────────
         if current_status == "live":
+            # ✅ SAFETY: Verify with 365Scores AGAIN before sending live_update
+            is_actually_live, phase = self._verify_live_status_with_365scores(match)
+            if not is_actually_live:
+                # 365Scores says not live — correct and return
+                if minutes_to_kickoff is not None and minutes_to_kickoff > 0:
+                    new_status = "soon" if minutes_to_kickoff <= SOON_THRESHOLD_MINUTES else "upcoming"
+                    logger.warning(
+                        f"⚠️ {match_id}: About to send live_update but 365Scores says NOT LIVE — "
+                        f"CORRECTING to '{new_status}'"
+                    )
+                    self.store.update_status(match_id, new_status)
+                    self.forwarder.forward_live_update({
+                        "fixture_id": match_id,
+                        "event_type": "status_change",
+                        "status": new_status,
+                        "is_live": False,
+                        "available_for_voting": new_status in ("upcoming", "soon"),
+                        "minutes_to_kickoff": minutes_to_kickoff,
+                    })
+                    match["status"] = new_status
+                    return
+                else:
+                    # Unknown situation — skip live_update this cycle
+                    logger.warning(
+                        f"⚠️ {match_id}: Skipping live_update — 365Scores says NOT LIVE "
+                        f"(phase='{phase}', minutes_to_kickoff={minutes_to_kickoff})"
+                    )
+                    return
+
             self._fetch_live_updates(match)
 
-        # --- STEP 5: FETCH COMMENTARY (365Scores, same source as
-        # stats/lineups/live-updates -- live matches only) ---
+        # ──────────────────────────────────────────────────────────────────────
+        # STEP 5: FETCH COMMENTARY (live matches only)
+        # ──────────────────────────────────────────────────────────────────────
         if current_status == "live":
             self._fetch_commentary(match)
 
-        # --- STEP 6: CHECK COMPLETION ---
+        # ──────────────────────────────────────────────────────────────────────
+        # STEP 6: CHECK COMPLETION
+        # ──────────────────────────────────────────────────────────────────────
         if self.state_machine.should_finalize_result(match):
             self._finalize_match_result(match)
 
@@ -322,15 +529,7 @@ class Poller:
 
     def _fetch_commentary(self, match: Dict[str, Any]):
         """
-        Fetch commentary from 365Scores (same source/session as stats,
-        lineups, and live updates -- no Flashscore ID resolution needed).
-
-        365Scores' /web/game/ endpoint returns the FULL commentary
-        history on every call, not just new entries, so we de-dup using
-        the same forwardedEventSignatures set already used for goal/
-        card/sub events. Signature-based dedup is ordering-agnostic,
-        unlike slicing by a stored count, in case 365Scores ever changes
-        whether the list is oldest-first or newest-first.
+        Fetch commentary from 365Scores.
         """
         match_id = match.get("matchId")
         game_id = match.get("threesixtyfiveGameId")
@@ -370,7 +569,6 @@ class Poller:
         if not new_entries:
             return
 
-        # Oldest first so the commentary feed renders in the right order
         new_entries.sort(key=lambda e: e.get("minute", 0))
 
         logger.info(f"📝 {match_id}: {len(new_entries)} new commentary entries")
@@ -381,17 +579,7 @@ class Poller:
 
     @staticmethod
     def _team_lineup_for_forwarder(team_lineup: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        threesixtyfive.fetch_lineups() returns each side as
-        {"formation", "status", "members": [...]}. forwarder.py's
-        clean_team() reads "players" (not "members") and has no concept
-        of a separate "bench" list from 365Scores -- so map members
-        straight into "players" here. If a given member dict carries a
-        365Scores field indicating starting vs. bench (check the raw
-        payload -- e.g. a "lineup"/"isStarting" style flag), split it out
-        into "bench" here too; left as a single "players" list for now
-        since fetch_lineups()'s own docstring doesn't document that field.
-        """
+        """Convert 365Scores lineup format to forwarder format."""
         if not team_lineup:
             return {}
         return {
@@ -400,11 +588,9 @@ class Poller:
         }
 
     def _fetch_and_forward_lineups(self, match: Dict[str, Any]):
-        """Fetch lineups and forward to Rust API using the new /web/game/ endpoint."""
+        """Fetch lineups and forward to Rust API."""
         match_id = match.get("matchId")
         game_id = match.get("threesixtyfiveGameId")
-
-        # Get competitor IDs from match data (stored during scraping)
         away_id = match.get("away_competitor_id")
         home_id = match.get("home_competitor_id")
         competition_id = match.get("competition_id", 5930)
@@ -426,12 +612,6 @@ class Poller:
             )
 
             if lineups:
-                # threesixtyfive.fetch_lineups() returns
-                # {"fixture_id", "home", "away"} flat -- forwarder.py's
-                # forward_lineups() expects "fixture_id", "home_team",
-                # "away_team", and a nested "lineups": {home, away}, each
-                # with a "players" key (not "members"). Reshape here
-                # rather than touching forwarder.py.
                 lineups_shaped = {
                     "home": self._team_lineup_for_forwarder(lineups.get("home", {})),
                     "away": self._team_lineup_for_forwarder(lineups.get("away", {})),
@@ -443,20 +623,6 @@ class Poller:
                     "lineups": lineups_shaped,
                 }
 
-                # NOTE: deliberately NOT writing lineups_shaped to Mongo
-                # directly here anymore. A raw self.store.store_lineups()
-                # write bypasses Rust's typed LineupsDocument builder
-                # (which adds matchId, homeTeam, awayTeam, and fetchedAt
-                # at the embedded-document level). When that raw shape
-                # persisted instead of being reliably overwritten by the
-                # HTTP path below, it corrupted fixtures.lineups with a
-                # document missing 'matchId', which crashed EVERY /live
-                # and /upcoming fetch for that fixture (see wc26_4749268
-                # incident, 2026-07-03). The only correct writer of
-                # fixtures.lineups is now Rust's store_lineups() handler,
-                # reached via forward_lineups() below.
-
-                # Forward to Rust API
                 success = self.forwarder.forward_lineups(lineups_payload)
                 if success:
                     self.store.mark_lineups_fetched(match_id)
@@ -474,15 +640,7 @@ class Poller:
         match: Dict[str, Any],
         game: Optional[Dict[str, Any]] = None,
     ):
-        """
-        Store + forward a statistics snapshot.
-
-        Only ever called at halftime, during a stoppage, or at full-time
-        (see should_forward_statistics() / classify_match_phase()) -- not
-        on every live tick. If `game` (from this cycle's already-fetched
-        fetch_game_details() response) is supplied, it's reused directly
-        instead of making a second network request.
-        """
+        """Store + forward a statistics snapshot."""
         match_id = match.get("matchId")
         game_id = match.get("threesixtyfiveGameId")
         away_id = match.get("away_competitor_id")
@@ -502,21 +660,11 @@ class Poller:
             )
 
         if stats:
-            # Defensive int() cast here too -- even though
-            # threesixtyfive.py now casts gameTime to int at the source,
-            # this direct MongoDB write bypasses forwarder.py's own
-            # int() cast, so a future upstream float would otherwise
-            # corrupt fixtures.statistics again (see wc26_4749268 incident).
             minute = int(stats.get("minute", 0) or 0)
             team_stats = {"home": stats.get("home", {}), "away": stats.get("away", {})}
 
             self.store.add_statistics_snapshot(match_id, team_stats, minute)
 
-            # threesixtyfive.fetch_statistics() returns home/away/minute
-            # flat -- forwarder.py's forward_statistics() requires a
-            # top-level "fixture_id" plus a nested "statistics": {home,
-            # away}, or it silently logs "Missing fixture_id" and returns
-            # False. Wrap it into that shape here.
             self.forwarder.forward_statistics({
                 "fixture_id": match_id,
                 "minute": minute,
@@ -525,7 +673,10 @@ class Poller:
             logger.debug(f"📊 Statistics forwarded for {match_id} at {minute}'")
 
     def _fetch_live_updates(self, match: Dict[str, Any]):
-        """Fetch live updates (scores, events, commentary)."""
+        """
+        Fetch live updates (scores, events, commentary).
+        ✅ UPDATED: Contains its OWN verification before sending live_update.
+        """
         match_id = match.get("matchId")
         game_id = match.get("threesixtyfiveGameId")
         away_id = match.get("away_competitor_id")
@@ -546,6 +697,57 @@ class Poller:
             return
 
         game = details.get("game", {})
+        status_group = game.get("statusGroup")
+        status_text = game.get("statusText", "")
+
+        # ✅ SAFETY CHECK: Verify the match is ACTUALLY live
+        # 365Scores statusGroup: 2 = scheduled, 3 = live, 4 = finished
+        if status_group == STATUS_GROUP_SCHEDULED:
+            minutes_remaining = match.get("minutes_to_kickoff")
+            if minutes_remaining is not None and minutes_remaining > 0:
+                logger.warning(
+                    f"⚠️ {match_id}: 365Scores says 'scheduled' (statusGroup=2) but in live_update — "
+                    f"CORRECTING to 'soon' ({minutes_remaining:.0f} mins to kickoff)"
+                )
+                self.store.update_status(match_id, "soon")
+                self.forwarder.forward_live_update({
+                    "fixture_id": match_id,
+                    "event_type": "status_change",
+                    "status": "soon",
+                    "is_live": False,
+                    "available_for_voting": True,
+                    "minutes_to_kickoff": minutes_remaining,
+                })
+                match["status"] = "soon"
+                return
+            else:
+                logger.warning(
+                    f"⚠️ {match_id}: 365Scores says 'scheduled' (statusGroup=2) — "
+                    f"SKIPPING live_update"
+                )
+                return
+
+        if status_group == STATUS_GROUP_FINISHED:
+            logger.info(f"🏁 {match_id}: 365Scores says FINISHED — marking completed")
+            self.store.update_status(match_id, "completed")
+            self._finalize_match_result(match)
+            return
+
+        # If status_group is None or unknown, check statusText
+        if status_group is None:
+            live_markers = ("1st half", "2nd half", "first half", "second half", "halftime", "ht", "live")
+            if not any(marker in status_text.lower() for marker in live_markers):
+                minutes_remaining = match.get("minutes_to_kickoff")
+                if minutes_remaining is not None and minutes_remaining > 5:
+                    logger.warning(
+                        f"⚠️ {match_id}: statusText='{status_text}' doesn't indicate live — "
+                        f"SKIPPING live_update"
+                    )
+                    return
+
+        # ✅ If we made it here, the match is actually live
+        logger.info(f"🔴 {match_id}: Verified ACTUALLY live (statusGroup={status_group}, statusText='{status_text}')")
+
         home_comp = game.get("homeCompetitor", {})
         away_comp = game.get("awayCompetitor", {})
 
@@ -553,10 +755,6 @@ class Poller:
         home_score = home_comp.get("score")
         away_score = away_comp.get("score")
 
-        # 365Scores uses -1 as a sentinel for "no score yet" (pre-match),
-        # not None. Treating -1 as a real score writes garbage into Mongo
-        # and logs a fake "score updated" event for matches that haven't
-        # actually started scoring yet.
         has_real_score = (
             home_score is not None
             and away_score is not None
@@ -567,38 +765,31 @@ class Poller:
         if has_real_score:
             self.store.update_score(match_id, home_score, away_score)
             logger.info(f"📊 {match_id}: Score updated {home_score}-{away_score}")
-        else:
-            logger.debug(
-                f"{match_id}: Ignoring placeholder score "
-                f"({home_score}-{away_score}), match hasn't started scoring yet"
-            )
 
-        # Classify the match phase from statusText, and fetch/forward
-        # statistics ONLY at halftime, during a stoppage, or at full-time --
-        # never on a normal in-play tick. We reuse the `game` object from
-        # the fetch_game_details() call above, so this costs no extra
-        # network request.
-        raw_status_text = game.get("statusText")
-        phase = threesixtyfive.classify_match_phase(raw_status_text)
+        # Classify the match phase from statusText
+        phase = threesixtyfive.classify_match_phase(status_text)
         if self.state_machine.should_forward_statistics(match_id, phase):
-            logger.info(f"📊 {match_id}: phase={phase} ({raw_status_text!r}) - fetching statistics")
+            logger.info(f"📊 {match_id}: phase={phase} ({status_text!r}) - fetching statistics")
             self._fetch_and_forward_statistics(match, game=game)
             self.state_machine.mark_stats_forwarded(match_id, phase)
 
         # Check if match ended
-        if phase == "fulltime":
+        if phase == "fulltime" or status_group == STATUS_GROUP_FINISHED:
+            logger.info(f"🏁 {match_id}: Match ended — marking completed")
             self.store.update_status(match_id, "completed")
             self._finalize_match_result(match)
             return
 
-        # Forward live update -- only send real scores downstream, never -1
+        # ✅ Only send live_update if we've verified it's actually live
         live_update = {
             "fixture_id": match_id,
             "event_type": "live_update",
             "home_score": home_score if has_real_score else 0,
             "away_score": away_score if has_real_score else 0,
-            "minute": game.get("gameTime", 0),
+            "minute": int(game.get("gameTime", 0) or 0),
             "status": "live",
+            "is_live": True,
+            "available_for_voting": False,
         }
         self.forwarder.forward_live_update(live_update)
 
@@ -621,14 +812,8 @@ class Poller:
         else:
             result = "draw"
 
-        finalize_payload = {
-            "fixture_id": match_id,
-            "result": result,
-            "home_score": home_score,
-            "away_score": away_score,
-        }
-
-        success = self.forwarder.finalize_match(finalize_payload)
+        # Use move_to_history instead of deprecated finalize_match
+        success = self.forwarder.move_to_history(match_id)
         if success:
             self.state_machine.mark_completed_notified(match_id)
             logger.info(f"🏁 Match {match_id} finalized: {result} ({home_score}-{away_score})")
