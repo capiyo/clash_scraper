@@ -3,6 +3,8 @@ World Cup fixture scraper — fetches this week's fixtures only (today + 6 days)
 Calls threesixtyfive.fetch_games_by_competition(), which now hits the
 CONFIRMED-working /web/games/fixtures/ endpoint.
 """
+
+# Invoke-RestMethod -Uri "https://clash-scraper.onrender.com/scrape" -Method GET
 from __future__ import annotations
 
 import datetime

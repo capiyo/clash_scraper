@@ -48,6 +48,8 @@ class MatchStateMachine:
         self.lineups_fetched = set()
         self.stats_started = set()
         self.completed_notified = set()
+        self.settlement_retries = {}  # match_id -> attempt_count
+        self.max_settlement_retries = 3
 
     def determine_state(self, match: Dict[str, Any]) -> str:
         """Determine the current state based on kickoff time."""
@@ -74,7 +76,6 @@ class MatchStateMachine:
         if status == "completed":
             return "completed"
 
-        # Force "live" if kickoff time has passed
         if minutes_until_kickoff <= 0:
             return "live"
         if minutes_until_kickoff <= SOON_THRESHOLD_MINUTES:
@@ -85,31 +86,26 @@ class MatchStateMachine:
         """Determine if status should be updated. Smart correction included."""
         current_status = match.get("status", "upcoming")
         minutes_to_kickoff = match.get("minutes_to_kickoff")
-        state = match.get("_state")  # Pre-computed state from determine_state
+        state = match.get("_state")
 
         if current_status == "completed":
             return None
 
-        # --- SMART CORRECTION ---
-        # If state is "live" but current_status is not "live", force it
         if state == "live" and current_status != "live":
             if minutes_to_kickoff is not None and minutes_to_kickoff <= 0:
                 logger.info(f"⏰ Forcing 'live': state=live, status={current_status}")
                 return "live"
 
-        # If state is "soon" but current_status is "live", correct it
         if state == "soon" and current_status == "live":
             if minutes_to_kickoff is not None and minutes_to_kickoff > 0:
                 logger.info(f"🔄 Correcting 'live' → 'soon' ({minutes_to_kickoff:.0f} mins to kickoff)")
                 return "soon"
 
-        # If state is "upcoming" but current_status is "soon" or "live", correct it
         if state == "upcoming" and current_status in ("soon", "live"):
             if minutes_to_kickoff is not None and minutes_to_kickoff > SOON_THRESHOLD_MINUTES:
                 logger.info(f"🔄 Correcting '{current_status}' → 'upcoming' ({minutes_to_kickoff:.0f} mins to kickoff)")
                 return "upcoming"
 
-        # Normal transitions
         if minutes_to_kickoff is not None and minutes_to_kickoff <= 0 and current_status != "live":
             return "live"
 
@@ -128,7 +124,6 @@ class MatchStateMachine:
         state: str,
         minutes_to_kickoff: Optional[float] = None,
     ) -> bool:
-        """Determine if we should fetch lineups."""
         match_id = match.get("matchId")
 
         if match_id in self.lineups_fetched:
@@ -137,12 +132,10 @@ class MatchStateMachine:
         if state == "completed":
             return False
 
-        # If match is live and no lineups, fetch them
         if state == "live":
             logger.info(f"📋 {match_id}: Live but no lineups - fetching now")
             return True
 
-        # Fetch in "soon" state within the window
         if state == "soon" and minutes_to_kickoff is not None:
             should_fetch = LINEUP_LATE_THRESHOLD <= minutes_to_kickoff <= LINEUP_EARLY_THRESHOLD
             if should_fetch:
@@ -152,7 +145,6 @@ class MatchStateMachine:
         return False
 
     def should_forward_statistics(self, match_id: str, phase: Optional[str]) -> bool:
-        """Determine if we should forward statistics at this phase."""
         if phase not in ("halftime", "stopped", "fulltime"):
             return False
         return (match_id, phase) not in self.stats_started
@@ -161,7 +153,6 @@ class MatchStateMachine:
         self.stats_started.add((match_id, phase))
 
     def should_finalize_result(self, match: Dict[str, Any]) -> bool:
-        """Determine if we should finalize the match result."""
         match_id = match.get("matchId")
         status = match.get("status", "")
 
@@ -172,6 +163,16 @@ class MatchStateMachine:
             return False
 
         return True
+
+    def should_retry_settlement(self, match_id: str) -> bool:
+        attempts = self.settlement_retries.get(match_id, 0)
+        return attempts < self.max_settlement_retries
+
+    def record_settlement_attempt(self, match_id: str):
+        self.settlement_retries[match_id] = self.settlement_retries.get(match_id, 0) + 1
+
+    def mark_settlement_success(self, match_id: str):
+        self.settlement_retries.pop(match_id, None)
 
     def mark_lineups_done(self, match_id: str):
         self.lineups_fetched.add(match_id)
@@ -198,7 +199,7 @@ class Poller:
             except Exception as e:
                 logger.error(f"Poll cycle failed: {e}", exc_info=True)
             self.poll_count += 1
-            time.sleep(3)  # Small delay between cycles
+            time.sleep(3)
 
     def poll_once(self):
         all_fixtures = self.store.get_all_fixtures()
@@ -216,7 +217,6 @@ class Poller:
                 logger.error(f"Error processing match {match.get('matchId')}: {e}", exc_info=True)
 
     def _verify_live_status_with_365scores(self, match: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
-        """Check with 365Scores if the match is actually live."""
         match_id = match.get("matchId")
         game_id = match.get("threesixtyfiveGameId")
         away_id = match.get("away_competitor_id")
@@ -244,7 +244,6 @@ class Poller:
         status_group = game.get("statusGroup")
         status_text = game.get("statusText", "")
 
-        # Check if there's a real score
         home_score = game.get("homeCompetitor", {}).get("score")
         away_score = game.get("awayCompetitor", {}).get("score")
         has_real_score = (
@@ -257,7 +256,6 @@ class Poller:
             f"score={home_score}-{away_score}"
         )
 
-        # If there's a real score, it's definitely live
         if has_real_score and (home_score > 0 or away_score > 0):
             return True, status_text
 
@@ -268,14 +266,12 @@ class Poller:
         elif status_group == STATUS_GROUP_FINISHED:
             return False, "finished"
         else:
-            # Check statusText for live markers
             live_markers = ("1st half", "2nd half", "first half", "second half", "halftime", "ht", "live")
             if any(marker in status_text.lower() for marker in live_markers):
                 return True, status_text
             return False, status_text
 
     def _process_match(self, match: Dict[str, Any]):
-        """Process a single match with smart state management."""
         match_id = match.get("matchId")
         game_id = match.get("threesixtyfiveGameId")
 
@@ -283,9 +279,6 @@ class Poller:
             logger.warning(f"No 365Scores game_id for {match_id}, skipping")
             return
 
-        # ──────────────────────────────────────────────────────────────────────
-        # STEP 0: Calculate kickoff time
-        # ──────────────────────────────────────────────────────────────────────
         kickoff_utc = match.get("kickoffUtc")
         minutes_to_kickoff = None
         kickoff_passed = False
@@ -305,17 +298,11 @@ class Poller:
 
         match["minutes_to_kickoff"] = minutes_to_kickoff
 
-        # ──────────────────────────────────────────────────────────────────────
-        # STEP 1: Get state from state machine
-        # ──────────────────────────────────────────────────────────────────────
         state = self.state_machine.determine_state(match)
-        match["_state"] = state  # Store for use in should_update_status
+        match["_state"] = state
 
         current_status = match.get("status", "upcoming")
 
-        # ──────────────────────────────────────────────────────────────────────
-        # STEP 2: SMARTER CORRECTION - Force "live" if kickoff passed
-        # ──────────────────────────────────────────────────────────────────────
         if kickoff_passed and current_status != "live":
             logger.warning(
                 f"⏰ {match_id}: Kickoff passed ({minutes_to_kickoff:.0f} mins ago) "
@@ -334,35 +321,25 @@ class Poller:
             current_status = "live"
             self._notify_match_live(match)
 
-        # ──────────────────────────────────────────────────────────────────────
-        # STEP 3: Normal status update (with smart correction)
-        # ──────────────────────────────────────────────────────────────────────
         new_status = self.state_machine.should_update_status(match)
 
         if new_status and new_status != current_status:
-            # Double-check: if transitioning to "live", verify with 365Scores
             if new_status == "live":
-                # If kickoff passed, just do it
                 if kickoff_passed:
                     logger.info(f"⏰ {match_id}: Kickoff passed, transitioning to 'live'")
-                    # Allow transition
                 else:
-                    # Verify with 365Scores
                     is_actually_live, _ = self._verify_live_status_with_365scores(match)
                     if not is_actually_live and minutes_to_kickoff is not None and minutes_to_kickoff > 2:
-                        # 365Scores says not live yet, and we're more than 2 mins from kickoff
                         logger.info(
                             f"⏳ {match_id}: 365Scores says not live yet, delaying 'soon' → 'live' "
                             f"({minutes_to_kickoff:.0f} mins to kickoff)"
                         )
                         new_status = None
                     elif not is_actually_live and minutes_to_kickoff is not None and minutes_to_kickoff <= 2:
-                        # Within 2 minutes of kickoff — trust the state machine
                         logger.info(
                             f"⏰ {match_id}: Near kickoff ({minutes_to_kickoff:.0f} mins) — "
                             f"transitioning to 'live' even though 365Scores not updated yet"
                         )
-                        # Allow transition
 
             if new_status and new_status != current_status:
                 logger.info(f"📊 {match_id}: {current_status} → {new_status}")
@@ -384,28 +361,16 @@ class Poller:
                 if new_status == "live":
                     self._notify_match_live(match)
 
-        # ──────────────────────────────────────────────────────────────────────
-        # STEP 4: Fetch lineups (if in soon state)
-        # ──────────────────────────────────────────────────────────────────────
         if self.state_machine.should_fetch_lineups(match, current_status, minutes_to_kickoff):
             self._fetch_and_forward_lineups(match)
             self.state_machine.mark_lineups_done(match_id)
 
-        # ──────────────────────────────────────────────────────────────────────
-        # STEP 5: Fetch live updates (if live)
-        # ──────────────────────────────────────────────────────────────────────
         if current_status == "live":
             self._fetch_live_updates(match)
 
-        # ──────────────────────────────────────────────────────────────────────
-        # STEP 6: Fetch commentary (if live)
-        # ──────────────────────────────────────────────────────────────────────
         if current_status == "live":
             self._fetch_commentary(match)
 
-        # ──────────────────────────────────────────────────────────────────────
-        # STEP 7: Check completion
-        # ──────────────────────────────────────────────────────────────────────
         if self.state_machine.should_finalize_result(match):
             self._finalize_match_result(match)
 
@@ -548,8 +513,51 @@ class Poller:
             })
             logger.debug(f"📊 Statistics forwarded for {match_id} at {minute}'")
 
+    def _settle_and_complete_match(self, match: Dict[str, Any], game: Dict[str, Any]):
+        """Settle bets, mark completed, and move to history."""
+        match_id = match.get("matchId")
+        
+        home_comp = game.get("homeCompetitor", {})
+        away_comp = game.get("awayCompetitor", {})
+        
+        home_score = home_comp.get("score")
+        away_score = away_comp.get("score")
+        
+        if home_score is None or away_score is None:
+            logger.warning(f"⚠️ Missing scores for {match_id}, cannot settle")
+            return
+        
+        if home_score > away_score:
+            result = "home"
+        elif away_score > home_score:
+            result = "away"
+        else:
+            result = "draw"
+        
+        logger.info(f"💰 Settling bets for {match_id}: {result} ({home_score}-{away_score})")
+        
+        settle_success = self.forwarder.settle_bets(match_id, result)
+        
+        if settle_success:
+            logger.info(f"✅ Bets settled for {match_id}")
+            self.state_machine.mark_settlement_success(match_id)
+            
+            self.store.update_score(match_id, home_score, away_score)
+            self.store.update_status(match_id, "completed")
+            
+            history_success = self.forwarder.move_to_history(match_id)
+            if history_success:
+                logger.info(f"📦 {match_id} moved to history")
+                self.state_machine.mark_completed_notified(match_id)
+            else:
+                logger.warning(f"⚠️ Match {match_id} settled but failed to move to history")
+        else:
+            self.state_machine.record_settlement_attempt(match_id)
+            logger.warning(
+                f"⚠️ Settlement failed for {match_id} (attempt {self.state_machine.settlement_retries.get(match_id, 0)})"
+            )
+
     def _fetch_live_updates(self, match: Dict[str, Any]):
-        """Fetch live updates (scores, events)."""
         match_id = match.get("matchId")
         game_id = match.get("threesixtyfiveGameId")
         away_id = match.get("away_competitor_id")
@@ -588,21 +596,32 @@ class Poller:
             self.store.update_score(match_id, home_score, away_score)
             logger.info(f"📊 {match_id}: Score updated {home_score}-{away_score}")
 
-        # Classify phase
         phase = threesixtyfive.classify_match_phase(status_text)
         if self.state_machine.should_forward_statistics(match_id, phase):
             logger.info(f"📊 {match_id}: phase={phase} ({status_text!r}) - fetching statistics")
             self._fetch_and_forward_statistics(match, game=game)
             self.state_machine.mark_stats_forwarded(match_id, phase)
 
-        # Check if match ended
+        # ─── MATCH END DETECTION ──────────────────────────────────────────────
         if phase == "fulltime" or status_group == STATUS_GROUP_FINISHED:
-            logger.info(f"🏁 {match_id}: Match ended — marking completed")
-            self.store.update_status(match_id, "completed")
-            self._finalize_match_result(match)
+            logger.info(f"🏁 {match_id}: Match ended")
+            
+            # Check if already settled
+            if match_id in self.state_machine.completed_notified:
+                logger.info(f"⏭️ {match_id} already completed and notified")
+                return
+            
+            # Check if we should retry settlement
+            if not self.state_machine.should_retry_settlement(match_id):
+                logger.warning(f"⚠️ {match_id}: Max settlement retries reached, forcing completion")
+                self.store.update_status(match_id, "completed")
+                self._finalize_match_result(match)
+                return
+            
+            # Settle bets and complete match
+            self._settle_and_complete_match(match, game)
             return
 
-        # Send live update
         live_update = {
             "fixture_id": match_id,
             "event_type": "live_update",
@@ -633,7 +652,6 @@ class Poller:
         else:
             result = "draw"
 
-        # Use move_to_history
         success = self.forwarder.move_to_history(match_id)
         if success:
             self.state_machine.mark_completed_notified(match_id)

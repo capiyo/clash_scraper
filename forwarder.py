@@ -52,7 +52,6 @@ class Forwarder:
             return False
 
     def _put(self, endpoint: str, data: Dict[str, Any]) -> bool:
-        """PUT method for endpoints that require it."""
         url = f"{self.api_url}{endpoint}"
         try:
             response = self.session.put(url, json=data, timeout=self.timeout)
@@ -76,16 +75,13 @@ class Forwarder:
             return None
 
     def _format_timestamp(self, ts) -> str:
-        """Format timestamp for Rust BsonDateTime - MUST have milliseconds and timezone"""
         if ts is None:
             return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
         if isinstance(ts, datetime):
             return ts.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
         if isinstance(ts, str):
-            # Clean up the string
             ts = ts.replace('+00:00', 'Z')
             if '.' not in ts:
-                # Add milliseconds if missing
                 ts = ts.replace('Z', '').replace('+00:00', '')
                 ts = ts + ".000Z"
             if not ts.endswith('Z') and '+' not in ts:
@@ -94,17 +90,13 @@ class Forwarder:
         return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
     def _clean(self, data: Dict) -> Dict:
-        """Remove None values from payload"""
         return {k: v for k, v in data.items() if v is not None}
 
     # ============================================================
-    # LIVE UPDATES - MATCHES RUST LiveGameUpdate
+    # LIVE UPDATES
     # ============================================================
 
     def forward_live_update(self, update: Dict[str, Any]) -> bool:
-        """
-        Rust expects LiveGameUpdate with camelCase fields.
-        """
         payload = self._clean({
             "fixtureId": update.get("fixture_id"),
             "eventType": update.get("event_type"),
@@ -124,27 +116,10 @@ class Forwarder:
         return self._post("/games/live-update", payload)
 
     # ============================================================
-    # COMMENTARY - MATCHES RUST CommentaryUpdate / CommentaryBulkUpdate
+    # COMMENTARY
     # ============================================================
 
     def _normalize_commentary_entry(self, entry: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Shared normalization for a single commentary entry -> Rust
-        CommentaryEntry shape:
-            - minute: i32
-            - text: String
-            - type: String (NOT event_type)
-            - team: Option<String>
-            - player: Option<String>
-            - createdAt: BsonDateTime (string, with milliseconds and timezone)
-
-        Used by BOTH the singular (forward_commentary) and bulk
-        (forward_commentary_bulk) paths so they can never drift out of
-        sync with each other -- previously forward_commentary_bulk sent
-        raw, unnormalized entries straight through, which is what let
-        commentary silently fail to broadcast over WebSocket even though
-        it was landing in MongoDB via the poller's direct store write.
-        """
         try:
             minute = int(entry.get("minute", 0))
         except (ValueError, TypeError):
@@ -152,7 +127,6 @@ class Forwarder:
 
         text = str(entry.get("text", ""))
 
-        # Ensure type is correct (use "type" field, fallback to "event_type")
         event_type = entry.get("type")
         if not event_type:
             event_type = entry.get("event_type")
@@ -160,7 +134,6 @@ class Forwarder:
             event_type = "commentary"
         event_type = str(event_type)
 
-        # Format timestamp for BsonDateTime - with milliseconds and timezone
         created_at = entry.get("createdAt")
         if not created_at:
             created_at = entry.get("created_at")
@@ -176,12 +149,6 @@ class Forwarder:
         })
 
     def forward_commentary(self, commentary: Dict[str, Any]) -> bool:
-        """
-        Forward a single commentary entry to Rust API.
-        Rust expects CommentaryUpdate with:
-        - match_id: String
-        - entry: CommentaryEntry (see _normalize_commentary_entry)
-        """
         entry = commentary.get("entry", {})
         match_id = commentary.get("match_id")
 
@@ -198,18 +165,6 @@ class Forwarder:
         return self._post("/games/commentary", payload)
 
     def forward_commentary_bulk(self, fixture_id: str, entries: List[Dict[str, Any]]) -> bool:
-        """
-        Forward a batch of commentary entries in a single request.
-        Rust expects CommentaryBulkUpdate with:
-        - match_id: String
-        - entries: Vec<CommentaryEntry> (each normalized the same way
-          as the singular path -- see _normalize_commentary_entry)
-
-        POSTs to /games/commentary/bulk, which stores all entries in one
-        $push/$each and fires a single "commentary.bulk" WebSocket
-        broadcast for the whole batch, rather than one broadcast per
-        entry.
-        """
         if not fixture_id:
             logger.error("Missing fixture_id in bulk commentary")
             return False
@@ -228,13 +183,10 @@ class Forwarder:
         return self._post("/games/commentary/bulk", payload)
 
     # ============================================================
-    # STATISTICS - MATCHES RUST StatisticsSnapshotPayload
+    # STATISTICS
     # ============================================================
 
     def forward_statistics(self, statistics: Dict[str, Any]) -> bool:
-        """
-        Rust expects StatisticsSnapshotPayload with snake_case fields.
-        """
         stats = statistics.get("statistics", {})
         
         payload = self._clean({
@@ -253,36 +205,13 @@ class Forwarder:
         return self._post("/games/statistics", payload)
 
     # ============================================================
-    # LINEUPS - MATCHES RUST LineupsUpdate
+    # LINEUPS
     # ============================================================
 
     def forward_lineups(self, lineups: Dict[str, Any]) -> bool:
-        """
-        Rust expects LineupsUpdate with camelCase fields, and each player
-        inside lineups.home/away.players/bench must match Rust's
-        PlayerPayload exactly: name (str), position (str -- NOT an
-        object), jerseyNumber (int), captain (bool), lineup (str:
-        "starting"/"bench"), playerId (str, optional).
-
-        threesixtyfive.fetch_lineups() hands us raw 365Scores "members"
-        entries here (status, statusText, position: {...object...},
-        ranking, competitorId, id, name, shortName, athleteId). Those do
-        NOT match PlayerPayload's shape -- forwarding them unmodified
-        causes axum to reject the whole POST (position isn't a string),
-        which silently drops lineups for the match, and previously
-        (before this fix) let a stale/malformed shape get written to
-        Mongo directly and crash every read of that fixture (see
-        wc26_4749268 incident, 2026-07-03). clean_player() below maps
-        the raw member shape into PlayerPayload's shape instead of
-        passing it through.
-        """
         lineups_data = lineups.get("lineups", {})
 
         def clean_player(member: Dict[str, Any]) -> Dict[str, Any]:
-            # TODO: confirm these key names against a full raw 365Scores
-            # member object (the ones we've inspected show only 9 of 11
-            # fields expanded) -- jerseyNumber/captain in particular may
-            # live under different keys than guessed here.
             position = member.get("position")
             position_name = (
                 position.get("name") or position.get("shortName")
@@ -318,9 +247,6 @@ class Forwarder:
             members = data.get("players") or data.get("members") or []
             starting = [clean_player(m) for m in members if m.get("status") == 1]
             bench = [clean_player(m) for m in members if m.get("status") != 1]
-            # Some callers may already pass a pre-split "bench" list
-            # (e.g. local/back-compat paths) -- fold those in too rather
-            # than dropping them.
             bench.extend(clean_player(m) for m in data.get("bench", []))
 
             return {
@@ -347,26 +273,38 @@ class Forwarder:
         return self._post("/games/lineups", payload)
 
     # ============================================================
-    # FINALIZE MATCH - MOVED TO HISTORY
+    # BET SETTLEMENT
     # ============================================================
 
-    def finalize_match(self, finalize_data: Dict[str, Any]) -> bool:
+    def settle_bets(self, fixture_id: str, result: str) -> bool:
         """
-        DEPRECATED: /games/finalize doesn't exist in Rust API.
-        Use move_to_history() instead.
+        Settle all bets for a completed match.
+        
+        Args:
+            fixture_id: The match ID (e.g., "wc26_4627864")
+            result: "home", "away", or "draw"
+        
+        Returns:
+            True if settlement succeeded, False otherwise
         """
-        logger.warning("finalize_match is deprecated - use move_to_history() instead")
-        fixture_id = finalize_data.get("fixture_id")
-        if not fixture_id:
-            logger.error("Missing fixture_id in finalize")
+        if result not in ["home", "away", "draw"]:
+            logger.error(f"Invalid result for settlement: {result}")
             return False
-        return self.move_to_history(fixture_id)
+
+        payload = {
+            "fixture_id": fixture_id,
+            "result": result,
+        }
+        
+        logger.info(f"💰 Settling bets for {fixture_id} with result: {result}")
+        return self._post("/actions/bet/settle", payload)
+
+    # ============================================================
+    # HISTORY / ARCHIVE
+    # ============================================================
 
     def move_to_history(self, fixture_id: str) -> bool:
-        """
-        Move a completed match to history.
-        POST /games/{fixture_id}/move-to-history
-        """
+        """Move a completed match to history."""
         if not fixture_id:
             logger.error("Missing fixture_id for move_to_history")
             return False
