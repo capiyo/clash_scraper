@@ -8,7 +8,7 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 
 from dotenv import load_dotenv
@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from forwarder import Forwarder
 from mongo_store import FixtureStore
 from sources import threesixtyfive
+import scraper
 
 load_dotenv()
 
@@ -182,12 +183,28 @@ class MatchStateMachine:
 
 
 class Poller:
+    # How often the scheduled (non-reactive) rescrape runs, regardless of
+    # whether any match has completed. This is a *backstop* for the reactive
+    # trigger in _trigger_rescrape (called right after a match is archived)
+    # -- it exists purely to cover cases where a match never cleanly
+    # finalizes (stuck state, crashed poll cycle, etc.) and the reactive
+    # path never fires, so `fixtures` could otherwise silently starve.
+    # Deliberately NOT a cron job / separate Render service -- this is a
+    # plain elapsed-time check inside the existing poll loop, so the
+    # scraper still only actually runs once or twice a day, using the
+    # single already-running process.
+    SCHEDULED_RESCRAPE_INTERVAL = timedelta(hours=12)  # twice a day
+
     def __init__(self, store: FixtureStore, forwarder: Forwarder):
         self.store = store
         self.forwarder = forwarder
         self.state_machine = MatchStateMachine(store, forwarder)
         self.running = False
         self.poll_count = 0
+        # Seeded to "already due" so the very first poll cycle after startup
+        # also performs a scrape -- covers the case where the service was
+        # just deployed/restarted and `fixtures` is empty.
+        self.last_scheduled_scrape = datetime.now(timezone.utc) - self.SCHEDULED_RESCRAPE_INTERVAL
 
     def start(self):
         self.running = True
@@ -201,7 +218,20 @@ class Poller:
             self.poll_count += 1
             time.sleep(3)
 
+    def _maybe_scheduled_rescrape(self):
+        """Backstop rescrape, independent of match completion. Runs at most
+        once per SCHEDULED_RESCRAPE_INTERVAL (twice a day) -- checked on
+        every poll cycle, but only actually triggers a scrape when the
+        interval has elapsed, so this does not turn into a de facto cron
+        job running every few seconds."""
+        now = datetime.now(timezone.utc)
+        if now - self.last_scheduled_scrape >= self.SCHEDULED_RESCRAPE_INTERVAL:
+            self.last_scheduled_scrape = now
+            self._trigger_rescrape(reason="scheduled twice-daily backstop")
+
     def poll_once(self):
+        self._maybe_scheduled_rescrape()
+
         all_fixtures = self.store.get_all_fixtures()
 
         if not all_fixtures:
@@ -418,7 +448,14 @@ class Poller:
         logger.info(f"📝 {match_id}: {len(new_entries)} new commentary entries")
 
         self.forwarder.forward_commentary_bulk(match_id, new_entries)
-        self.store.add_commentary_bulk(match_id, new_entries)
+        # NOTE: removed self.store.add_commentary_bulk(match_id, new_entries)
+        # direct-write here. It used upsert=True and was silently recreating
+        # zombie fixture documents (partial docs with an auto-generated
+        # ObjectId _id) whenever commentary kept arriving for a match that
+        # had already been archived to games_history and deleted from
+        # `fixtures`. forward_commentary_bulk above already persists this
+        # correctly via the Rust API, which safely no-ops (DocumentNotFound)
+        # instead of upserting when the fixture is gone.
         self.store.add_forwarded_event_signatures_bulk(match_id, new_signatures)
 
     @staticmethod
@@ -549,6 +586,7 @@ class Poller:
             if history_success:
                 logger.info(f"📦 {match_id} moved to history")
                 self.state_machine.mark_completed_notified(match_id)
+                self._trigger_rescrape(reason=f"{match_id} archived via settlement")
             else:
                 logger.warning(f"⚠️ Match {match_id} settled but failed to move to history")
         else:
@@ -634,6 +672,23 @@ class Poller:
         }
         self.forwarder.forward_live_update(live_update)
 
+    def _trigger_rescrape(self, reason: str = ""):
+        """Immediately re-run fixture discovery so a freshly-archived slot
+        in `fixtures` gets refilled with upcoming matches right away,
+        instead of waiting for the next scheduled /scrape trigger.
+
+        Runs synchronously in the poll loop -- a slow 365Scores response
+        here will delay polling of other live matches for that cycle. If
+        that becomes a problem in practice (e.g. several matches finishing
+        around the same time during a busy tournament window), move the
+        body of this into a daemon thread instead of calling it inline."""
+        try:
+            logger.info(f"🔄 Triggering rescrape ({reason})...")
+            new_count = scraper.scrape_world_cup_fixtures(self.store)
+            logger.info(f"✅ Rescrape complete: {new_count} fixtures upserted")
+        except Exception as e:
+            logger.error(f"❌ Rescrape failed: {e}")
+
     def _finalize_match_result(self, match: Dict[str, Any]):
         match_id = match.get("matchId")
         game = self.store.get_fixture(match_id)
@@ -656,6 +711,7 @@ class Poller:
         if success:
             self.state_machine.mark_completed_notified(match_id)
             logger.info(f"🏁 Match {match_id} finalized: {result} ({home_score}-{away_score})")
+            self._trigger_rescrape(reason=f"{match_id} finalized")
 
     def _notify_match_live(self, match: Dict[str, Any]):
         match_id = match.get("matchId")

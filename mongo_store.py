@@ -338,7 +338,10 @@ class FixtureStore:
                     "scrapedAt": datetime.now(timezone.utc),
                 }
             },
-            upsert=True,
+            upsert=False,  # NOTE: was upsert=True -- creating a fixture doc from
+            # a lineups write alone produced partial/zombie documents once the
+            # real fixture no longer existed (already archived to history).
+            # Lineups should never be the thing that creates a fixture.
         )
 
     def mark_lineups_fetched(self, match_id: str) -> None:
@@ -409,7 +412,9 @@ class FixtureStore:
                     "scrapedAt": datetime.now(timezone.utc),
                 }
             },
-            upsert=True,
+            upsert=False,  # NOTE: was upsert=True -- same zombie-doc risk as
+            # add_commentary below. A statistics push should never be able to
+            # create a fixture document out of thin air.
         )
 
     def get_statistics(self, match_id: str) -> List[Dict]:
@@ -489,7 +494,15 @@ class FixtureStore:
                 "$inc": {"commentaryCount": 1},
                 "$set": {"lastCommentaryAt": now, "scrapedAt": now},
             },
-            upsert=True,
+            upsert=False,  # NOTE: was upsert=True. This was the actual root
+            # cause of zombie fixture documents appearing after archival --
+            # 365Scores' commentary/pbp feed keeps producing entries for a
+            # match for a while after full-time, so this call was still
+            # firing after move_completed_to_history had already deleted the
+            # real document, silently recreating a partial stub (matchId +
+            # commentary + commentaryCount + lastCommentaryAt + scrapedAt,
+            # with an auto-generated ObjectId _id instead of matchId).
+            # Commentary should never be able to create a fixture document.
         )
 
     def add_commentary_bulk(self, match_id: str, entries: List[Dict]) -> None:
@@ -507,7 +520,8 @@ class FixtureStore:
                 "$inc": {"commentaryCount": len(entries)},
                 "$set": {"lastCommentaryAt": now, "scrapedAt": now},
             },
-            upsert=True,
+            upsert=False,  # NOTE: was upsert=True -- see add_commentary above
+            # for why. Same zombie-doc mechanism, bulk variant.
         )
 
     def get_commentary(self, match_id: str, limit: int = 50) -> List[Dict]:
