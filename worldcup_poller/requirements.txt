@@ -1,0 +1,4 @@
+python-dotenv
+pymongo
+curl_cffi
+requests
