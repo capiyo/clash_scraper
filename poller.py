@@ -333,23 +333,50 @@ class Poller:
 
         current_status = match.get("status", "upcoming")
 
-        if kickoff_passed and current_status != "live":
-            logger.warning(
-                f"⏰ {match_id}: Kickoff passed ({minutes_to_kickoff:.0f} mins ago) "
-                f"but status is '{current_status}' — FORCING 'live'"
-            )
-            self.store.update_status(match_id, "live")
-            self.forwarder.forward_live_update({
-                "fixture_id": match_id,
-                "event_type": "status_change",
-                "status": "live",
-                "is_live": True,
-                "available_for_voting": False,
-                "minutes_to_kickoff": minutes_to_kickoff,
-            })
-            match["status"] = "live"
-            current_status = "live"
-            self._notify_match_live(match)
+        if kickoff_passed and current_status not in ("live", "completed"):
+            # CRITICAL: verify with 365Scores before forcing -- previously
+            # this fired purely off kickoff_utc having passed, with no
+            # check against what's actually happening in the real match.
+            # That meant a manually-corrected "soon" status (e.g. for a
+            # delayed/postponed fixture, or one whose scraped kickoff time
+            # was simply wrong) got silently overridden back to "live"
+            # within one poll cycle, fighting the manual correction.
+            is_actually_live, verify_status_text = self._verify_live_status_with_365scores(match)
+
+            if not is_actually_live:
+                logger.info(
+                    f"⏳ {match_id}: Kickoff time passed ({minutes_to_kickoff:.0f} mins ago) "
+                    f"but 365Scores doesn't show it as live yet ('{verify_status_text}') -- "
+                    f"leaving status as '{current_status}', not forcing 'live'"
+                )
+            else:
+                logger.warning(
+                    f"⏰ {match_id}: Kickoff passed ({minutes_to_kickoff:.0f} mins ago) "
+                    f"but status is '{current_status}' — FORCING 'live'"
+                )
+                self.store.update_status(match_id, "live")
+
+                # Preserve whatever score is already known for this fixture
+                # instead of blindly sending 0-0. This is a status-only
+                # correction -- we don't have a fresh score here -- and
+                # previously stomped real in-progress scores back to 0-0
+                # every single time this safety net fired.
+                known_home_score = match.get("homeScore") or 0
+                known_away_score = match.get("awayScore") or 0
+
+                self.forwarder.forward_live_update({
+                    "fixture_id": match_id,
+                    "event_type": "status_change",
+                    "status": "live",
+                    "home_score": known_home_score,
+                    "away_score": known_away_score,
+                    "is_live": True,
+                    "available_for_voting": False,
+                    "minutes_to_kickoff": minutes_to_kickoff,
+                })
+                match["status"] = "live"
+                current_status = "live"
+                self._notify_match_live(match)
 
         new_status = self.state_machine.should_update_status(match)
 
@@ -447,16 +474,29 @@ class Poller:
         new_entries.sort(key=lambda e: e.get("minute", 0))
         logger.info(f"📝 {match_id}: {len(new_entries)} new commentary entries")
 
-        self.forwarder.forward_commentary_bulk(match_id, new_entries)
         # NOTE: removed self.store.add_commentary_bulk(match_id, new_entries)
         # direct-write here. It used upsert=True and was silently recreating
         # zombie fixture documents (partial docs with an auto-generated
         # ObjectId _id) whenever commentary kept arriving for a match that
         # had already been archived to games_history and deleted from
-        # `fixtures`. forward_commentary_bulk above already persists this
-        # correctly via the Rust API, which safely no-ops (DocumentNotFound)
-        # instead of upserting when the fixture is gone.
-        self.store.add_forwarded_event_signatures_bulk(match_id, new_signatures)
+        # `fixtures`. forward_commentary_bulk below persists this correctly
+        # via the Rust API, which safely no-ops (DocumentNotFound) instead
+        # of upserting when the fixture is gone.
+        #
+        # CRITICAL: only record signatures as "forwarded" if the POST
+        # actually succeeded. Previously this ran unconditionally, so a
+        # failing /games/commentary/bulk call (404/500/timeout) still
+        # marked every entry as delivered -- permanently dropping that
+        # commentary, since the signature check at the top of this method
+        # skips anything already in forwardedEventSignatures.
+        success = self.forwarder.forward_commentary_bulk(match_id, new_entries)
+        if success:
+            self.store.add_forwarded_event_signatures_bulk(match_id, new_signatures)
+        else:
+            logger.error(
+                f"❌ {match_id}: forward_commentary_bulk failed for "
+                f"{len(new_entries)} entries -- will retry next cycle"
+            )
 
     @staticmethod
     def _team_lineup_for_forwarder(team_lineup: Dict[str, Any]) -> Dict[str, Any]:
