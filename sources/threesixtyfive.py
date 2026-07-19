@@ -2,6 +2,7 @@
 365Scores API client for World Cup data.
 Fetches: fixtures, live scores, events, lineups, statistics, and commentary.
 """
+
 from __future__ import annotations
 
 import logging
@@ -50,7 +51,15 @@ def is_game_finished(game: Dict[str, Any]) -> bool:
 
     # Check 3: statusText - 365Scores uses "Ended"
     status_text = (game.get("statusText") or "").strip().lower()
-    finished_keywords = ["ended", "finished", "ft", "full-time", "aet", "pen", "penalties"]
+    finished_keywords = [
+        "ended",
+        "finished",
+        "ft",
+        "full-time",
+        "aet",
+        "pen",
+        "penalties",
+    ]
     if status_text in finished_keywords:
         return True
 
@@ -62,7 +71,10 @@ def is_game_finished(game: Dict[str, Any]) -> bool:
             # Also check if we have a winner (both scores set)
             home_comp = game.get("homeCompetitor", {})
             away_comp = game.get("awayCompetitor", {})
-            if home_comp.get("score") is not None and away_comp.get("score") is not None:
+            if (
+                home_comp.get("score") is not None
+                and away_comp.get("score") is not None
+            ):
                 return True
 
     # Check 5: If game has ended but statusText contains "ended" in any form
@@ -93,18 +105,20 @@ def fetch_games_by_competition(
     }
 
     url = f"{BASE_URL}/web/games/fixtures/"
-    
+
     try:
         logger.debug(f"Fetching from {url} with params {params}")
         response = requests.get(url, headers=DEFAULT_HEADERS, params=params, timeout=30)
         response.raise_for_status()
-        
+
         data = response.json()
         games = data.get("games", [])
-        logger.info(f"fetch_games_by_competition({competition_ids}): {len(games)} games returned")
-        
+        logger.info(
+            f"fetch_games_by_competition({competition_ids}): {len(games)} games returned"
+        )
+
         return games
-        
+
     except requests.exceptions.RequestException as e:
         logger.error(f"Failed to fetch games from 365Scores: {e}")
         return None
@@ -119,11 +133,11 @@ def fetch_game_details(
     home_id: int,
     competition_id: int,
     lang_id: int = 1,
-    user_country_id: int = 413
+    user_country_id: int = 413,
 ) -> Optional[Dict[str, Any]]:
     """
     Fetch full game details including lineups using the /web/game/ endpoint.
-    
+
     Args:
         game_id: 365Scores game ID (e.g., "4627864")
         away_id: Away team competitor ID
@@ -131,12 +145,12 @@ def fetch_game_details(
         competition_id: Competition ID (e.g., 5930)
         lang_id: Language ID (1 = English)
         user_country_id: Country ID (413 = Kenya)
-    
+
     Returns:
         Full game data including lineups, statistics, events, commentary
     """
     matchup_id = f"{away_id}-{home_id}-{competition_id}"
-    
+
     params = {
         "appTypeId": 5,
         "langId": lang_id,
@@ -145,18 +159,18 @@ def fetch_game_details(
         "gameId": game_id,
         "matchupId": matchup_id,
     }
-    
+
     url = f"{BASE_URL}/web/game/"
-    
+
     try:
         logger.debug(f"Fetching game details from {url} with params {params}")
         response = requests.get(url, headers=DEFAULT_HEADERS, params=params, timeout=30)
         response.raise_for_status()
-        
+
         data = response.json()
         logger.info(f"fetch_game_details({game_id}): Success")
         return data
-        
+
     except requests.exceptions.RequestException as e:
         logger.error(f"Failed to fetch game details for {game_id}: {e}")
         return None
@@ -166,14 +180,11 @@ def fetch_game_details(
 
 
 def fetch_lineups(
-    game_id: str,
-    away_id: int,
-    home_id: int,
-    competition_id: int
+    game_id: str, away_id: int, home_id: int, competition_id: int
 ) -> Optional[Dict[str, Any]]:
     """
     Fetch only lineups from the game details endpoint.
-    
+
     Returns:
         {
             "home": {
@@ -189,19 +200,19 @@ def fetch_lineups(
         }
     """
     data = fetch_game_details(game_id, away_id, home_id, competition_id)
-    
+
     if not data or "game" not in data:
         logger.warning(f"No game data found for {game_id}")
         return None
-    
+
     game = data.get("game", {})
-    
+
     home_competitor = game.get("homeCompetitor", {})
     away_competitor = game.get("awayCompetitor", {})
-    
+
     home_lineups = home_competitor.get("lineups")
     away_lineups = away_competitor.get("lineups")
-    
+
     if not home_lineups and not away_lineups:
         logger.debug(f"No lineups available for {game_id}")
         return None
@@ -231,7 +242,7 @@ def fetch_lineups(
         "home": home_lineups or {},
         "away": away_lineups or {},
     }
-    
+
     logger.info(f"fetch_lineups({game_id}): Found lineups")
     return result
 
@@ -244,8 +255,23 @@ import re
 # "suspended" too. \b works fine for multi-word phrases like "half time"
 # since spaces are already non-word characters.
 HALFTIME_STATUS_KEYWORDS = ("ht", "half time", "halftime")
-STOPPED_STATUS_KEYWORDS = ("stopped", "suspended", "interrupted", "delayed", "abandoned")
-FULLTIME_STATUS_KEYWORDS = ("ft", "aet", "pen", "ended", "finished", "full-time", "full time", "penalties")
+STOPPED_STATUS_KEYWORDS = (
+    "stopped",
+    "suspended",
+    "interrupted",
+    "delayed",
+    "abandoned",
+)
+FULLTIME_STATUS_KEYWORDS = (
+    "ft",
+    "aet",
+    "pen",
+    "ended",
+    "finished",
+    "full-time",
+    "full time",
+    "penalties",
+)
 
 
 def _matches(text: str, keywords: tuple) -> bool:
@@ -309,10 +335,7 @@ def extract_statistics_from_game(game: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def fetch_statistics(
-    game_id: str,
-    away_id: int,
-    home_id: int,
-    competition_id: int
+    game_id: str, away_id: int, home_id: int, competition_id: int
 ) -> Optional[Dict[str, Any]]:
     """
     Fetch statistics from the game details endpoint.
@@ -322,19 +345,16 @@ def fetch_statistics(
     to avoid a redundant network request.
     """
     data = fetch_game_details(game_id, away_id, home_id, competition_id)
-    
+
     if not data or "game" not in data:
         return None
-    
+
     game = data.get("game", {})
     return extract_statistics_from_game(game)
 
 
 def fetch_commentary(
-    game_id: str,
-    away_id: int,
-    home_id: int,
-    competition_id: int
+    game_id: str, away_id: int, home_id: int, competition_id: int
 ) -> List[Dict[str, Any]]:
     """
     Fetch commentary via 365Scores' separate play-by-play feed
@@ -419,34 +439,184 @@ def fetch_commentary(
         players = entry.get("Players") or []
         player = players[0].get("PlayerName") if players else None
 
-        commentary_list.append({
-            "minute": minute,
-            "text": text,
-            "type": entry.get("TypeName", "commentary"),
-            "team": None,  # not directly present -- CompetitorNum(1/2) could be mapped to team name if needed later
-            "player": player,
-        })
+        commentary_list.append(
+            {
+                "minute": minute,
+                "text": text,
+                "type": entry.get("TypeName", "commentary"),
+                "team": None,  # not directly present -- CompetitorNum(1/2) could be mapped to team name if needed later
+                "player": player,
+            }
+        )
 
     logger.info(f"fetch_commentary({game_id}): Found {len(commentary_list)} entries")
     return commentary_list
 
 
+def _competitor_num_to_side(competitor_num: Any) -> Optional[str]:
+    """365Scores' play-by-play feed marks each entry with CompetitorNum
+    (1 or 2), not a competitor id -- it can't be joined against
+    homeCompetitor/awayCompetitor.id the way fetch_lineups() joins
+    roster members.
+
+    ASSUMPTION (UNCONFIRMED, ported from wembly_leagues_scrapers):
+    NUM 1 = home, NUM 2 = away, matching the ordering 365Scores uses
+    everywhere else in this file (homeCompetitor first, awayCompetitor
+    second). Verify against one real play-by-play response before
+    trusting this for actual sub-fixture settlement -- if it's
+    backwards, every first_goal/first_card/first_corner market will
+    settle to the wrong team.
+    """
+    if competitor_num == 1:
+        return "home"
+    if competitor_num == 2:
+        return "away"
+    return None
+
+
+# TypeName markers for classifying play-by-play entries into the three
+# sub-fixture event buckets. Matched as substrings against the lowercased
+# TypeName -- these are guesses at 365Scores' actual English TypeName
+# strings ("Goal", "Yellow Card", "Red Card", "Corner", etc.) based on
+# common convention across similar feeds; confirm against a real payload
+# and adjust if 365Scores uses different wording.
+_CARD_TYPENAME_MARKERS = ("yellow card", "red card", "second yellow")
+_CORNER_TYPENAME_MARKERS = ("corner",)
+_GOAL_TYPENAME_MARKERS = ("goal",)  # checked last: keep order defensive
+
+
+def _classify_event_typename(type_name: Optional[str]) -> Optional[str]:
+    t = (type_name or "").strip().lower()
+    if any(m in t for m in _CARD_TYPENAME_MARKERS):
+        return "card"
+    if any(m in t for m in _CORNER_TYPENAME_MARKERS):
+        return "corner"
+    if any(m in t for m in _GOAL_TYPENAME_MARKERS):
+        return "goal"
+    return None
+
+
+def fetch_match_events(
+    game_id: str, away_id: int, home_id: int, competition_id: int
+) -> List[Dict[str, Any]]:
+    """
+    Discrete goal/card/corner events, derived from the SAME play-by-play
+    feed fetch_commentary() reads. This is what feeds the first_goal /
+    first_card / first_corner sub-fixture markets -- there is no other
+    per-event data source in this API client.
+
+    Returns [{event_type, minute, team, player}, ...] for entries
+    classified as goal/card/corner, sorted by minute. Anything else in
+    the feed (kickoff markers, half-end markers, general commentary) is
+    skipped here -- fetch_commentary() still returns those separately
+    for the chat/commentary feed; this makes its own network call
+    rather than sharing a single fetch with fetch_commentary(), so
+    fetch_commentary()'s existing behavior is left untouched.
+
+    KNOWN GAPS, ported from wembly_leagues_scrapers, both flagged inline
+    where they matter:
+      - Team attribution (_competitor_num_to_side) assumes
+        CompetitorNum 1=home, 2=away -- unconfirmed against a live
+        payload.
+      - Own goals are not special-cased. A TypeName containing "goal"
+        for an own goal will attribute the event to whichever side
+        CompetitorNum points at, which is backwards for a first_goal
+        market -- an own goal by the away team should count as a home
+        team's "first goal" for settlement purposes. Needs a real
+        payload to know whether 365Scores' TypeName distinguishes
+        "Own Goal" from "Goal" so this can be corrected.
+    """
+    data = fetch_game_details(game_id, away_id, home_id, competition_id)
+
+    if not data or "game" not in data:
+        return []
+
+    game = data.get("game", {})
+    pbp = game.get("playByPlay") or {}
+    feed_url = pbp.get("feedURL")
+
+    if not feed_url:
+        logger.debug(f"No playByPlay feedURL for {game_id}")
+        return []
+
+    # Force English -- 365Scores returns lang=37 (Dutch) by default here.
+    feed_url = re.sub(r"lang=\d+", "lang=1", feed_url)
+
+    try:
+        response = requests.get(feed_url, headers=DEFAULT_HEADERS, timeout=30)
+        response.raise_for_status()
+        raw = response.json()
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to fetch play-by-play feed for {game_id}: {e}")
+        return []
+    except ValueError as e:
+        logger.error(f"Failed to parse play-by-play JSON for {game_id}: {e}")
+        return []
+
+    raw_events = []
+    if isinstance(raw, list):
+        raw_events = raw
+    elif isinstance(raw, dict):
+        for value in raw.values():
+            if isinstance(value, list) and value and isinstance(value[0], dict):
+                raw_events = value
+                break
+
+    if not raw_events:
+        return []
+
+    events: List[Dict[str, Any]] = []
+    for entry in raw_events:
+        event_type = _classify_event_typename(entry.get("TypeName"))
+        if event_type is None:
+            continue
+
+        team = _competitor_num_to_side(entry.get("CompetitorNum"))
+        if team is None:
+            logger.debug(
+                f"{game_id}: skipping {event_type} event with unresolvable team "
+                f"(CompetitorNum={entry.get('CompetitorNum')!r})"
+            )
+            continue
+
+        minute_raw = entry.get("Timeline")
+        try:
+            minute = int(minute_raw) if minute_raw is not None else 0
+        except (ValueError, TypeError):
+            minute = 0
+
+        players = entry.get("Players") or []
+        player = players[0].get("PlayerName") if players else None
+
+        events.append(
+            {
+                "event_type": event_type,
+                "minute": minute,
+                "team": team,
+                "player": player,
+            }
+        )
+
+    events.sort(key=lambda e: e["minute"])
+    logger.info(
+        f"fetch_match_events({game_id}): Found {len(events)} goal/card/corner events"
+    )
+    return events
+
+
 def fetch_complete_match_data(
-    game_id: str,
-    away_id: int,
-    home_id: int,
-    competition_id: int
+    game_id: str, away_id: int, home_id: int, competition_id: int
 ) -> Optional[Dict[str, Any]]:
     """
     Fetch all match data: details, lineups, statistics, and commentary in one go.
     """
     data = fetch_game_details(game_id, away_id, home_id, competition_id)
-    
+
     if not data or "game" not in data:
         return None
-    
+
     game = data.get("game", {})
-    
+
     return {
         "game_id": game_id,
         "details": game,
@@ -481,7 +651,7 @@ def fetch_complete_match_data(
                 "passes": game.get("awayPasses"),
                 "pass_accuracy": game.get("awayPassAccuracy"),
             },
-            "minute": int(game.get("gameTime", 0) or 0)
+            "minute": int(game.get("gameTime", 0) or 0),
         },
         "commentary": game.get("commentary", []),
         "score": {

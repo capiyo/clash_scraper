@@ -11,10 +11,12 @@ import datetime
 import logging
 import os
 import sys
+from typing import Optional
 
 from dotenv import load_dotenv
 
 from mongo_store import FixtureStore
+from forwarder import Forwarder, create_forwarder
 from sources import threesixtyfive
 import config
 
@@ -33,17 +35,26 @@ SCRAPE_DAYS_AHEAD = 7
 
 import re
 
+
 def _status_to_internal(status_text: str) -> str:
     text = (status_text or "").strip().lower()
     if text in ("finished", "ft", "ended", "full-time", "aet", "pen"):
         return "completed"
-    
+
     # Word-boundary matching prevents "Live" in "Live Lineups" from matching
-    live_patterns = (r"\blive\b", r"\b1st half\b", r"\b2nd half\b", r"\bht\b", r"\bhalftime\b", r"\bin progress\b")
+    live_patterns = (
+        r"\blive\b",
+        r"\b1st half\b",
+        r"\b2nd half\b",
+        r"\bht\b",
+        r"\bhalftime\b",
+        r"\bin progress\b",
+    )
     if any(re.search(pattern, text) for pattern in live_patterns):
         return "live"
-    
+
     return "upcoming"
+
 
 def _parse_kickoff(start_time_raw: str | None) -> datetime.datetime:
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -55,7 +66,9 @@ def _parse_kickoff(start_time_raw: str | None) -> datetime.datetime:
         return now
 
 
-def scrape_world_cup_fixtures(store: FixtureStore) -> int:
+def scrape_world_cup_fixtures(
+    store: FixtureStore, forwarder: Optional[Forwarder] = None
+) -> int:
     today_utc = datetime.datetime.now(datetime.timezone.utc).date()
     cutoff = today_utc + datetime.timedelta(days=SCRAPE_DAYS_AHEAD)
 
@@ -88,7 +101,10 @@ def scrape_world_cup_fixtures(store: FixtureStore) -> int:
 
     logger.info(
         "%d games within %d-day window (%s to %s)",
-        len(in_window), SCRAPE_DAYS_AHEAD, today_utc, cutoff,
+        len(in_window),
+        SCRAPE_DAYS_AHEAD,
+        today_utc,
+        cutoff,
     )
 
     upserted = 0
@@ -104,7 +120,7 @@ def scrape_world_cup_fixtures(store: FixtureStore) -> int:
         status = _status_to_internal(game.get("statusText", ""))
         match_id = f"wc26_{game_id}"
 
-        store.upsert_fixture(
+        is_new = store.upsert_fixture(
             match_id=match_id,
             threesixtyfive_game_id=game_id,
             home_team=home_team,
@@ -115,14 +131,32 @@ def scrape_world_cup_fixtures(store: FixtureStore) -> int:
             kickoff_utc=kickoff,
             status=status,
             competition_name=comp_name,
-            odds=game.get("odds", {})
+            odds=game.get("odds", {}),
         )
         upserted += 1
         logger.info(
             "Upserted %s: %s vs %s [%s] kickoff=%s (%s)",
-            match_id, home_team, away_team, status,
-            kickoff.strftime("%Y-%m-%d %H:%M"), comp_name,
+            match_id,
+            home_team,
+            away_team,
+            status,
+            kickoff.strftime("%Y-%m-%d %H:%M"),
+            comp_name,
         )
+
+        # Sub-fixture markets (first_goal, first_card, first_corner,
+        # over_under_2_5) only ever get created here, the moment a
+        # fixture is FIRST inserted -- never on later re-scrapes of an
+        # already-existing fixture, so a match never ends up with
+        # duplicate markets from repeated /scrape triggers.
+        if is_new and forwarder is not None:
+            created_ok = forwarder.create_sub_fixture_markets(match_id)
+            if not created_ok:
+                logger.warning(
+                    f"⚠️ {match_id}: one or more sub-fixture markets failed to create "
+                    f"(see forwarder logs above) -- will NOT be retried automatically, "
+                    f"since is_new only fires once per fixture"
+                )
 
     return upserted
 
@@ -134,8 +168,9 @@ def main() -> None:
         sys.exit(1)
 
     store = FixtureStore(mongo_uri)
+    forwarder = create_forwarder()
     try:
-        count = scrape_world_cup_fixtures(store)
+        count = scrape_world_cup_fixtures(store, forwarder=forwarder)
         logger.info("Scrape complete: %d fixtures upserted", count)
     except Exception as exc:
         logger.error("Scrape failed: %s", exc)

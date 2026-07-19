@@ -13,6 +13,7 @@ flashscore_resolve_attempts, needs_flashscore_resolution(), etc.) has been
 removed -- commentary now comes from 365Scores via sources/threesixtyfive.py,
 so there's no separate ID resolution step needed.
 """
+
 from __future__ import annotations
 
 import logging
@@ -30,7 +31,9 @@ logger = logging.getLogger("worldcup_poller.mongo")
 class FixtureStore:
     def __init__(self, mongo_uri: str):
         self._client = MongoClient(mongo_uri)
-        self._collection: Collection = self._client[config.MONGO_DB][config.MONGO_COLLECTION]
+        self._collection: Collection = self._client[config.MONGO_DB][
+            config.MONGO_COLLECTION
+        ]
         self._ensure_indexes()
 
     def _ensure_indexes(self):
@@ -65,7 +68,7 @@ class FixtureStore:
         competition_id: Optional[int] = None,
         competition_name: str = "FIFA World Cup 2026",
         odds: dict = None,
-    ) -> None:
+    ) -> bool:
         """
         Upsert a fixture. Document keys match Rust's Game struct exactly
         (see models/game.rs): matchId, homeTeam, awayTeam, kickoffUtc,
@@ -81,6 +84,14 @@ class FixtureStore:
         causing fixtures to flip back to "live" while still an hour from
         kickoff. `status` is still accepted as a param here because it's
         needed for the initial insert.
+
+        Returns:
+            True if this call INSERTED a brand-new fixture document,
+            False if it matched and updated an existing one. Callers
+            (scraper.py) use this to fire sub-fixture market creation
+            exactly once per fixture, right when it's first created --
+            never on the later re-scrapes that only refresh odds/team
+            names for a fixture that already exists.
         """
         date_str = kickoff_utc.strftime("%Y-%m-%d")
         time_str = kickoff_utc.strftime("%H:%M")
@@ -121,7 +132,9 @@ class FixtureStore:
             # this must be passed as a string, not a Python datetime
             # object (which pymongo would otherwise encode as a native
             # BSON Date and fail deserialization on the Rust side).
-            "kickoffUtc": kickoff_utc.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "kickoffUtc": kickoff_utc.astimezone(timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z"),
             "homeWin": home_win,
             "awayWin": away_win,
             "draw": draw,
@@ -174,7 +187,7 @@ class FixtureStore:
             "timeElapsed": None,
         }
 
-        self._collection.update_one(
+        result = self._collection.update_one(
             {"matchId": match_id},
             {
                 "$set": doc,
@@ -182,6 +195,7 @@ class FixtureStore:
             },
             upsert=True,
         )
+        return result.upserted_id is not None
 
     def get_fixture(self, match_id: str) -> Optional[Dict[str, Any]]:
         """Get a single fixture by match_id."""
@@ -199,15 +213,15 @@ class FixtureStore:
         """Get fixtures within the next N days."""
         now = datetime.now(timezone.utc)
         cutoff = now + timedelta(days=days_ahead)
-        return list(self._collection.find({
-            "kickoffUtc": {"$gte": now, "$lte": cutoff}
-        }))
+        return list(
+            self._collection.find({"kickoffUtc": {"$gte": now, "$lte": cutoff}})
+        )
 
     def get_active_fixtures(self) -> List[Dict[str, Any]]:
         """Get fixtures that are upcoming, soon, or live."""
-        return list(self._collection.find({
-            "status": {"$in": ["upcoming", "soon", "live"]}
-        }))
+        return list(
+            self._collection.find({"status": {"$in": ["upcoming", "soon", "live"]}})
+        )
 
     def get_in_progress_fixtures(self) -> List[Dict[str, Any]]:
         """Get fixtures that are currently live."""
@@ -215,9 +229,7 @@ class FixtureStore:
 
     def get_upcoming_fixtures(self) -> List[Dict[str, Any]]:
         """Get fixtures that are upcoming or soon."""
-        return list(self._collection.find({
-            "status": {"$in": ["upcoming", "soon"]}
-        }))
+        return list(self._collection.find({"status": {"$in": ["upcoming", "soon"]}}))
 
     def get_soon_fixtures(self) -> List[Dict[str, Any]]:
         """Get fixtures in the 'soon' state."""
@@ -230,16 +242,16 @@ class FixtureStore:
     def get_stale_completed_fixtures(self, hours: int = 1) -> List[Dict[str, Any]]:
         """Get completed fixtures older than N hours."""
         cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-        return list(self._collection.find({
-            "status": "completed",
-            "completedAt": {"$lt": cutoff}
-        }))
+        return list(
+            self._collection.find(
+                {"status": "completed", "completedAt": {"$lt": cutoff}}
+            )
+        )
 
     def get_threesixtyfive_game_id(self, match_id: str) -> Optional[str]:
         """Get the 365Scores game ID for a match."""
         doc = self._collection.find_one(
-            {"matchId": match_id},
-            {"threesixtyfiveGameId": 1}
+            {"matchId": match_id}, {"threesixtyfiveGameId": 1}
         )
         return doc.get("threesixtyfiveGameId") if doc else None
 
@@ -266,10 +278,7 @@ class FixtureStore:
         if status == "completed":
             update["completedAt"] = datetime.now(timezone.utc)
 
-        self._collection.update_one(
-            {"matchId": match_id},
-            {"$set": update}
-        )
+        self._collection.update_one({"matchId": match_id}, {"$set": update})
 
     def update_score(self, match_id: str, home_score: int, away_score: int) -> None:
         """Update score for a match."""
@@ -281,14 +290,13 @@ class FixtureStore:
                     "awayScore": away_score,
                     "scrapedAt": datetime.now(timezone.utc),
                 }
-            }
+            },
         )
 
     def update_time_elapsed(self, match_id: str, time_elapsed: int) -> None:
         """Update the elapsed time for a match."""
         self._collection.update_one(
-            {"matchId": match_id},
-            {"$set": {"timeElapsed": time_elapsed}}
+            {"matchId": match_id}, {"$set": {"timeElapsed": time_elapsed}}
         )
 
     def mark_live(self, match_id: str) -> None:
@@ -304,7 +312,7 @@ class FixtureStore:
         Game struct shown -- harmless extra field, ignored by serde."""
         self._collection.update_one(
             {"matchId": match_id},
-            {"$set": {"lastPolledAt": datetime.now(timezone.utc)}}
+            {"$set": {"lastPolledAt": datetime.now(timezone.utc)}},
         )
 
     # ============================================================
@@ -348,23 +356,24 @@ class FixtureStore:
         """Mark that lineups have been fetched."""
         self._collection.update_one(
             {"matchId": match_id},
-            {"$set": {"lineupsFetched": True, "lineupsFetchedAt": datetime.now(timezone.utc)}}
+            {
+                "$set": {
+                    "lineupsFetched": True,
+                    "lineupsFetchedAt": datetime.now(timezone.utc),
+                }
+            },
         )
 
     def get_lineups(self, match_id: str) -> Optional[Dict]:
         """Get stored lineups for a match."""
         doc = self._collection.find_one(
-            {"matchId": match_id},
-            {"lineups": 1, "lineupsFetched": 1}
+            {"matchId": match_id}, {"lineups": 1, "lineupsFetched": 1}
         )
         return doc.get("lineups") if doc else None
 
     def lineups_available(self, match_id: str) -> bool:
         """Check if lineups are available for a match."""
-        doc = self._collection.find_one(
-            {"matchId": match_id},
-            {"lineupsFetched": 1}
-        )
+        doc = self._collection.find_one({"matchId": match_id}, {"lineupsFetched": 1})
         return doc.get("lineupsFetched", False) if doc else False
 
     # ============================================================
@@ -401,7 +410,7 @@ class FixtureStore:
         snapshot = {
             "minute": minute,
             "statistics": stats,
-            "timestamp": datetime.now(timezone.utc)
+            "timestamp": datetime.now(timezone.utc),
         }
         self._collection.update_one(
             {"matchId": match_id},
@@ -410,7 +419,7 @@ class FixtureStore:
                 "$set": {
                     "lastStatisticsMinute": minute,
                     "scrapedAt": datetime.now(timezone.utc),
-                }
+                },
             },
             upsert=False,  # NOTE: was upsert=True -- same zombie-doc risk as
             # add_commentary below. A statistics push should never be able to
@@ -419,18 +428,12 @@ class FixtureStore:
 
     def get_statistics(self, match_id: str) -> List[Dict]:
         """Get all statistics snapshots for a match."""
-        doc = self._collection.find_one(
-            {"matchId": match_id},
-            {"statistics": 1}
-        )
+        doc = self._collection.find_one({"matchId": match_id}, {"statistics": 1})
         return doc.get("statistics", []) if doc else []
 
     def get_latest_statistics(self, match_id: str) -> Optional[Dict]:
         """Get the latest statistics snapshot for a match."""
-        doc = self._collection.find_one(
-            {"matchId": match_id},
-            {"statistics": 1}
-        )
+        doc = self._collection.find_one({"matchId": match_id}, {"statistics": 1})
         if doc and doc.get("statistics"):
             return doc["statistics"][-1]
         return None
@@ -442,8 +445,7 @@ class FixtureStore:
     def get_forwarded_event_signatures(self, match_id: str) -> set:
         """Get the set of event signatures already forwarded."""
         doc = self._collection.find_one(
-            {"matchId": match_id},
-            {"forwardedEventSignatures": 1}
+            {"matchId": match_id}, {"forwardedEventSignatures": 1}
         )
         if not doc:
             return set()
@@ -457,7 +459,9 @@ class FixtureStore:
             upsert=False,
         )
 
-    def add_forwarded_event_signatures_bulk(self, match_id: str, signatures: List[str]) -> None:
+    def add_forwarded_event_signatures_bulk(
+        self, match_id: str, signatures: List[str]
+    ) -> None:
         """Add multiple forwarded event signatures."""
         self._collection.update_one(
             {"matchId": match_id},
@@ -531,7 +535,7 @@ class FixtureStore:
             {"$unwind": "$commentary"},
             {"$sort": {"commentary.minute": 1}},
             {"$limit": limit},
-            {"$project": {"commentary": 1, "_id": 0}}
+            {"$project": {"commentary": 1, "_id": 0}},
         ]
         result = list(self._collection.aggregate(pipeline))
         return [r["commentary"] for r in result]
@@ -543,7 +547,7 @@ class FixtureStore:
             {"$unwind": "$commentary"},
             {"$sort": {"commentary.createdAt": -1}},
             {"$limit": limit},
-            {"$project": {"commentary": 1, "_id": 0}}
+            {"$project": {"commentary": 1, "_id": 0}},
         ]
         result = list(self._collection.aggregate(pipeline))
         return [r["commentary"] for r in result]
@@ -552,7 +556,9 @@ class FixtureStore:
     # MATCH FINALIZATION
     # ============================================================
 
-    def finalize_match(self, match_id: str, result: str, home_score: int, away_score: int) -> None:
+    def finalize_match(
+        self, match_id: str, result: str, home_score: int, away_score: int
+    ) -> None:
         """Finalize a match with its result."""
         self._collection.update_one(
             {"matchId": match_id},
@@ -567,14 +573,13 @@ class FixtureStore:
                     "completedAt": datetime.now(timezone.utc),
                     "scrapedAt": datetime.now(timezone.utc),
                 }
-            }
+            },
         )
 
     def move_to_history(self, match_id: str) -> None:
         """Mark a match as moved to history."""
         self._collection.update_one(
-            {"matchId": match_id},
-            {"$set": {"movedToHistory": True}}
+            {"matchId": match_id}, {"$set": {"movedToHistory": True}}
         )
 
     def archive_completed_fixtures(self, hours: int = 24) -> int:
@@ -586,7 +591,12 @@ class FixtureStore:
                 "completedAt": {"$lt": cutoff},
                 "movedToHistory": False,
             },
-            {"$set": {"movedToHistory": True, "archivedAt": datetime.now(timezone.utc)}}
+            {
+                "$set": {
+                    "movedToHistory": True,
+                    "archivedAt": datetime.now(timezone.utc),
+                }
+            },
         )
         return result.modified_count
 
@@ -597,7 +607,9 @@ class FixtureStore:
     # votedAt (camelCase, via #[serde(rename)]). The voter dict built here
     # must match that exactly or this field will fail deserialization too.
 
-    def add_voter(self, match_id: str, user_id: str, user_name: str, selection: str) -> None:
+    def add_voter(
+        self, match_id: str, user_id: str, user_name: str, selection: str
+    ) -> None:
         """Add a voter to a match. Matches Rust's Voter struct shape
         exactly: userId, userName, selection, votedAt."""
         voter = {
@@ -617,26 +629,17 @@ class FixtureStore:
 
     def get_voters(self, match_id: str) -> List[Dict]:
         """Get all voters for a match."""
-        doc = self._collection.find_one(
-            {"matchId": match_id},
-            {"voters": 1}
-        )
+        doc = self._collection.find_one({"matchId": match_id}, {"voters": 1})
         return doc.get("voters", []) if doc else []
 
     def get_vote_count(self, match_id: str) -> int:
         """Get the vote count for a match."""
-        doc = self._collection.find_one(
-            {"matchId": match_id},
-            {"votes": 1}
-        )
+        doc = self._collection.find_one({"matchId": match_id}, {"votes": 1})
         return doc.get("votes", 0) if doc else 0
 
     def user_has_voted(self, match_id: str, user_id: str) -> bool:
         """Check if a user has voted on a match."""
-        doc = self._collection.find_one({
-            "matchId": match_id,
-            "voters.userId": user_id
-        })
+        doc = self._collection.find_one({"matchId": match_id, "voters.userId": user_id})
         return doc is not None
 
     # ============================================================
@@ -674,10 +677,12 @@ class FixtureStore:
     def delete_old_fixtures(self, days: int = 30) -> int:
         """Delete fixtures older than N days (that are archived)."""
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-        result = self._collection.delete_many({
-            "movedToHistory": True,
-            "completedAt": {"$lt": cutoff},
-        })
+        result = self._collection.delete_many(
+            {
+                "movedToHistory": True,
+                "completedAt": {"$lt": cutoff},
+            }
+        )
         return result.deleted_count
 
     def close(self) -> None:
@@ -690,30 +695,31 @@ class FixtureStore:
 
     def get_fixture_counts_by_status(self) -> Dict[str, int]:
         """Get count of fixtures by status."""
-        pipeline = [
-            {"$group": {"_id": "$status", "count": {"$sum": 1}}}
-        ]
+        pipeline = [{"$group": {"_id": "$status", "count": {"$sum": 1}}}]
         results = list(self._collection.aggregate(pipeline))
         return {r["_id"]: r["count"] for r in results}
 
     def get_upcoming_fixtures_with_lineups(self) -> List[Dict]:
         """Get upcoming fixtures that have lineups available."""
-        return list(self._collection.find({
-            "status": {"$in": ["upcoming", "soon"]},
-            "lineupsFetched": True
-        }))
+        return list(
+            self._collection.find(
+                {"status": {"$in": ["upcoming", "soon"]}, "lineupsFetched": True}
+            )
+        )
 
     def get_live_fixtures_with_stats(self) -> List[Dict]:
         """Get live fixtures that have statistics."""
-        return list(self._collection.find({
-            "status": "live",
-            "statistics": {"$exists": True, "$ne": []}
-        }))
+        return list(
+            self._collection.find(
+                {"status": "live", "statistics": {"$exists": True, "$ne": []}}
+            )
+        )
 
 
 def create_store(mongo_uri: str = None) -> FixtureStore:
     """Create a FixtureStore instance with optional URI."""
     import os
+
     if mongo_uri is None:
         mongo_uri = os.environ.get("MONGO_URI")
     if not mongo_uri:
