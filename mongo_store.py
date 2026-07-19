@@ -6,12 +6,8 @@ write/query used snake_case, causing every fixture document to fail
 deserialization on the Rust side ("invalid type: map, expected a string" /
 documents silently skipped in GET /api/games).
 
-Handles: fixtures, lineups, statistics, events, commentary, state management.
-
-NOTE: Flashscore cross-reference bookkeeping (flashscore_id,
-flashscore_resolve_attempts, needs_flashscore_resolution(), etc.) has been
-removed -- commentary now comes from 365Scores via sources/threesixtyfive.py,
-so there's no separate ID resolution step needed.
+Handles: fixtures, lineups, statistics, events, commentary, state management,
+and sub-fixture markets (first_goal / first_card / first_corner props).
 """
 
 from __future__ import annotations
@@ -54,7 +50,6 @@ class FixtureStore:
     # ============================================================
     # FIXTURE CRUD OPERATIONS
     # ============================================================
-
     def upsert_fixture(
         self,
         match_id: str,
@@ -68,30 +63,23 @@ class FixtureStore:
         competition_id: Optional[int] = None,
         competition_name: str = "FIFA World Cup 2026",
         odds: dict = None,
-    ) -> bool:
+    ) -> None:
         """
         Upsert a fixture. Document keys match Rust's Game struct exactly
         (see models/game.rs): matchId, homeTeam, awayTeam, kickoffUtc,
         isLive, availableForVoting, homeWin/awayWin, scrapedAt, etc.
 
-        NOTE: status / isLive / availableForVoting are ONLY written on
-        INSERT (via $setOnInsert below), never on update. poller.py's
-        MatchStateMachine is the sole owner of those three fields for the
-        lifetime of a fixture -- scraper.py re-runs periodically just to
-        pick up new fixtures, and previously re-upserting an EXISTING
-        fixture would stomp poller.py's correct "soon"/"live" state back
-        to whatever scraper.py's own (cruder, statusText-based) guess was,
-        causing fixtures to flip back to "live" while still an hour from
-        kickoff. `status` is still accepted as a param here because it's
-        needed for the initial insert.
+        NOTE: Game.kickoff_utc is DateTime<Utc> -- a *required* field, not
+        Option -- so this must always be a real datetime, never None.
 
-        Returns:
-            True if this call INSERTED a brand-new fixture document,
-            False if it matched and updated an existing one. Callers
-            (scraper.py) use this to fire sub-fixture market creation
-            exactly once per fixture, right when it's first created --
-            never on the later re-scrapes that only refresh odds/team
-            names for a fixture that already exists.
+        NOTE: Game.home_competitor_id / away_competitor_id / competition_id
+        are not actually fields on the Rust Game struct shown -- they're
+        kept here as Python-side bookkeeping (used by poller.py for
+        lineups/stats lookups against 365Scores) but are NOT part of the
+        camelCase Rust contract, so they're stored as-is (snake_case) since
+        Rust's deserializer will simply ignore unknown fields it doesn't
+        have a struct field for (serde's default behavior is to ignore
+        unrecognized keys, not error on them).
         """
         date_str = kickoff_utc.strftime("%Y-%m-%d")
         time_str = kickoff_utc.strftime("%H:%M")
@@ -106,9 +94,10 @@ class FixtureStore:
             away_win = odds.get("awayWin", 1.0)
             draw = odds.get("draw", 1.0)
 
+        is_live = status == "live"
+        available_for_voting = status in ("upcoming", "soon")
+
         # Build the document -- camelCase keys matching Game's #[serde(rename)]
-        # status/isLive/availableForVoting deliberately NOT here anymore --
-        # moved to set_on_insert below.
         doc = {
             "matchId": match_id,
             "threesixtyfiveGameId": threesixtyfive_game_id,
@@ -135,6 +124,11 @@ class FixtureStore:
             "kickoffUtc": kickoff_utc.astimezone(timezone.utc)
             .isoformat()
             .replace("+00:00", "Z"),
+            "homeScore": None,
+            "awayScore": None,
+            "status": status,
+            "isLive": is_live,
+            "availableForVoting": available_for_voting,
             "homeWin": home_win,
             "awayWin": away_win,
             "draw": draw,
@@ -143,13 +137,7 @@ class FixtureStore:
             "lastScrapedAt": datetime.now(timezone.utc),
         }
 
-        # Fields that should ONLY be set on insert (user-generated data
-        # preserved, and now also status/isLive/availableForVoting/scores --
-        # once a fixture exists, only poller.py's state machine and
-        # update_score()/update_status() are allowed to change these).
-        is_live = status == "live"
-        available_for_voting = status in ("upcoming", "soon")
-
+        # Fields that should ONLY be set on insert (user-generated data preserved)
         set_on_insert = {
             # CRITICAL: explicitly set _id to the same string as matchId.
             # Without this, MongoDB auto-generates _id as a BSON ObjectId.
@@ -162,11 +150,6 @@ class FixtureStore:
             # after every other field was correctly renamed to camelCase --
             # the camelCase fix was necessary but not sufficient.
             "_id": match_id,
-            "status": status,
-            "isLive": is_live,
-            "availableForVoting": available_for_voting,
-            "homeScore": None,
-            "awayScore": None,
             "votes": 0,
             "voters": [],
             "comments": 0,
@@ -185,9 +168,18 @@ class FixtureStore:
             "createdAt": datetime.now(timezone.utc),
             "result": None,
             "timeElapsed": None,
+            # Flashscore cross-reference -- resolved lazily by poller.py once
+            # per fixture (name-match against Flashscore's schedule feed),
+            # not on every scrape. Nullable: a fixture is fully valid with
+            # this unset. NOT a Rust Game struct field -- Python/poller-side
+            # bookkeeping only, ignored by serde on read. Kept snake_case to
+            # signal that.
+            "flashscore_id": None,
+            "flashscore_resolved_at": None,
+            "flashscore_resolve_attempts": 0,
         }
 
-        result = self._collection.update_one(
+        self._collection.update_one(
             {"matchId": match_id},
             {
                 "$set": doc,
@@ -195,7 +187,6 @@ class FixtureStore:
             },
             upsert=True,
         )
-        return result.upserted_id is not None
 
     def get_fixture(self, match_id: str) -> Optional[Dict[str, Any]]:
         """Get a single fixture by match_id."""
@@ -262,7 +253,6 @@ class FixtureStore:
     # ============================================================
     # STATUS UPDATES
     # ============================================================
-
     def update_status(self, match_id: str, status: str) -> None:
         """Update match status."""
         is_live = status == "live"
@@ -316,6 +306,56 @@ class FixtureStore:
         )
 
     # ============================================================
+    # FLASHSCORE CROSS-REFERENCE
+    # ============================================================
+    # flashscore_id is resolved once per fixture (name-match against
+    # Flashscore's own schedule feed) and persisted here, rather than
+    # re-resolved on every commentary fetch. This keeps the hot polling
+    # path (every 15s while live) to a plain field read instead of a
+    # name-matching pass against an in-memory map on every cycle.
+    #
+    # These fields are NOT part of the Rust Game struct's camelCase
+    # contract -- kept snake_case deliberately, since they're Python/
+    # poller-side bookkeeping only. serde ignores unknown fields by
+    # default, so this causes no deserialization issues on the Rust side.
+    def needs_flashscore_resolution(
+        self, match: Dict[str, Any], max_attempts: int = 5
+    ) -> bool:
+        """
+        True if this fixture still needs its Flashscore ID resolved --
+        i.e. it doesn't have one yet, and hasn't already failed
+        max_attempts times (so a permanently-unmatchable name pair stops
+        being retried instead of hammering Flashscore's schedule feed
+        forever).
+        """
+        if match.get("flashscore_id"):
+            return False
+        return match.get("flashscore_resolve_attempts", 0) < max_attempts
+
+    def set_flashscore_id(self, match_id: str, flashscore_id: str) -> None:
+        """Persist a successfully resolved Flashscore match ID."""
+        self._collection.update_one(
+            {"matchId": match_id},
+            {
+                "$set": {
+                    "flashscore_id": flashscore_id,
+                    "flashscore_resolved_at": datetime.now(timezone.utc),
+                }
+            },
+        )
+
+    def record_flashscore_resolve_attempt(self, match_id: str) -> None:
+        """Record a failed resolution attempt (no match found this try)."""
+        self._collection.update_one(
+            {"matchId": match_id}, {"$inc": {"flashscore_resolve_attempts": 1}}
+        )
+
+    def get_flashscore_id(self, match_id: str) -> Optional[str]:
+        """Get the resolved Flashscore ID for a match, if any."""
+        doc = self._collection.find_one({"matchId": match_id}, {"flashscore_id": 1})
+        return doc.get("flashscore_id") if doc else None
+
+    # ============================================================
     # LINEUPS
     # ============================================================
     # NOTE: Rust's Game.lineups is Option<LineupsDocument>, a TYPED
@@ -329,7 +369,6 @@ class FixtureStore:
     # builds the LineupsDocument shape correctly on the Rust side -- these
     # Python-side methods are kept for local/back-compat use but should NOT
     # be the primary write path while that Rust endpoint exists.
-
     def store_lineups(self, match_id: str, lineups: Dict) -> None:
         """Store lineups and mark as fetched.
 
@@ -346,10 +385,7 @@ class FixtureStore:
                     "scrapedAt": datetime.now(timezone.utc),
                 }
             },
-            upsert=False,  # NOTE: was upsert=True -- creating a fixture doc from
-            # a lineups write alone produced partial/zombie documents once the
-            # real fixture no longer existed (already archived to history).
-            # Lineups should never be the thing that creates a fixture.
+            upsert=True,
         )
 
     def mark_lineups_fetched(self, match_id: str) -> None:
@@ -392,21 +428,11 @@ class FixtureStore:
     # TeamStatisticsPayload has NO #[serde(rename)] attributes, meaning it
     # expects snake_case wire keys, not camelCase -- confirm against your
     # actual struct before relying on this path).
-
     def add_statistics_snapshot(self, match_id: str, stats: Dict, minute: int) -> None:
         """Add a statistics snapshot at a specific minute.
 
         CAUTION: see note above -- prefer forwarding to the Rust
         /games/statistics endpoint over writing this field directly."""
-        # Defensive int() cast at the actual write boundary. Rust's
-        # StatisticsSnapshot.minute is a strict i32 -- a float here (e.g.
-        # 365Scores' gameTime returning 45.0 at halftime) gets stored as
-        # a BSON double and crashes every subsequent /games/live and
-        # /games/upcoming deserialization for this fixture with
-        # "invalid type: floating point, expected i32" (see wc26_4749268
-        # incident, 2026-07-03). Cast here too, not just at the caller,
-        # so this method is safe no matter what calls it in the future.
-        minute = int(minute or 0)
         snapshot = {
             "minute": minute,
             "statistics": stats,
@@ -421,9 +447,7 @@ class FixtureStore:
                     "scrapedAt": datetime.now(timezone.utc),
                 },
             },
-            upsert=False,  # NOTE: was upsert=True -- same zombie-doc risk as
-            # add_commentary below. A statistics push should never be able to
-            # create a fixture document out of thin air.
+            upsert=True,
         )
 
     def get_statistics(self, match_id: str) -> List[Dict]:
@@ -441,7 +465,6 @@ class FixtureStore:
     # ============================================================
     # EVENTS
     # ============================================================
-
     def get_forwarded_event_signatures(self, match_id: str) -> set:
         """Get the set of event signatures already forwarded."""
         doc = self._collection.find_one(
@@ -477,9 +500,8 @@ class FixtureStore:
     # REQUIRED, no Option. The `entry` dict passed in here must already
     # contain "minute", "type", "createdAt" (or this write will cause the
     # same deserialization failure for this match's document once read
-    # back by Rust). sources/threesixtyfive.py's fetch_commentary()
-    # already produces this exact shape (minus createdAt, added below).
-
+    # back by Rust). flashscore.py's _parse_commentary() already produces
+    # this exact shape -- see that file's docstring.
     def add_commentary(self, match_id: str, entry: Dict) -> None:
         """Add a commentary entry. `entry` must already match
         CommentaryEntry's shape: minute (int), text (str), type (str),
@@ -498,15 +520,7 @@ class FixtureStore:
                 "$inc": {"commentaryCount": 1},
                 "$set": {"lastCommentaryAt": now, "scrapedAt": now},
             },
-            upsert=False,  # NOTE: was upsert=True. This was the actual root
-            # cause of zombie fixture documents appearing after archival --
-            # 365Scores' commentary/pbp feed keeps producing entries for a
-            # match for a while after full-time, so this call was still
-            # firing after move_completed_to_history had already deleted the
-            # real document, silently recreating a partial stub (matchId +
-            # commentary + commentaryCount + lastCommentaryAt + scrapedAt,
-            # with an auto-generated ObjectId _id instead of matchId).
-            # Commentary should never be able to create a fixture document.
+            upsert=True,
         )
 
     def add_commentary_bulk(self, match_id: str, entries: List[Dict]) -> None:
@@ -524,8 +538,7 @@ class FixtureStore:
                 "$inc": {"commentaryCount": len(entries)},
                 "$set": {"lastCommentaryAt": now, "scrapedAt": now},
             },
-            upsert=False,  # NOTE: was upsert=True -- see add_commentary above
-            # for why. Same zombie-doc mechanism, bulk variant.
+            upsert=True,
         )
 
     def get_commentary(self, match_id: str, limit: int = 50) -> List[Dict]:
@@ -555,7 +568,6 @@ class FixtureStore:
     # ============================================================
     # MATCH FINALIZATION
     # ============================================================
-
     def finalize_match(
         self, match_id: str, result: str, home_score: int, away_score: int
     ) -> None:
@@ -606,7 +618,6 @@ class FixtureStore:
     # NOTE: Rust's Voter struct requires userId, userName, selection,
     # votedAt (camelCase, via #[serde(rename)]). The voter dict built here
     # must match that exactly or this field will fail deserialization too.
-
     def add_voter(
         self, match_id: str, user_id: str, user_name: str, selection: str
     ) -> None:
@@ -645,7 +656,6 @@ class FixtureStore:
     # ============================================================
     # BULK OPERATIONS
     # ============================================================
-
     def upsert_fixtures_bulk(self, fixtures: List[Dict]) -> int:
         """Bulk upsert fixtures. CAUTION: each fixture dict is written
         as-is via replace_one -- callers must ensure dicts already use
@@ -664,7 +674,6 @@ class FixtureStore:
                         }
                     }
                 )
-
         if operations:
             result = self._collection.bulk_write(operations)
             return result.upserted_count + result.modified_count
@@ -673,7 +682,6 @@ class FixtureStore:
     # ============================================================
     # CLEANUP
     # ============================================================
-
     def delete_old_fixtures(self, days: int = 30) -> int:
         """Delete fixtures older than N days (that are archived)."""
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
@@ -692,7 +700,6 @@ class FixtureStore:
     # ============================================================
     # AGGREGATION HELPERS
     # ============================================================
-
     def get_fixture_counts_by_status(self) -> Dict[str, int]:
         """Get count of fixtures by status."""
         pipeline = [{"$group": {"_id": "$status", "count": {"$sum": 1}}}]
@@ -716,6 +723,151 @@ class FixtureStore:
         )
 
 
+# ============================================================
+# SUB-FIXTURE MARKETS (first_goal / first_card / first_corner props)
+# ============================================================
+# Confirmed against sub_fixture_handler.rs: state.db.collection(
+# "sub_fixture_markets") is what every read handler opens
+# (get_markets_for_match_handler, get_sub_fixture_visibility_handler,
+# get_market_details_handler) -- this class writes to the same collection,
+# same database (config.MONGO_DB), same MongoClient pattern as FixtureStore.
+#
+# Field names match Rust's SubFixtureMarket struct exactly
+# (#[serde(rename_all = "camelCase")] on the whole struct, unlike Game
+# which uses per-field #[serde(rename = "...")]): matchId, marketId,
+# marketType, options, line, status, lockAt, pledgeCounts, pledgeTotals,
+# result, isVisible, createdAt, updatedAt, settledAt.
+#
+# KNOWN OUTSTANDING ISSUE (Rust-side, not fixed by this file): the three
+# read handlers in sub_fixture_handler.rs query with snake_case keys
+# ("match_id", "is_visible") via the doc! macro, which does NOT go through
+# serde's rename -- so they will never match documents written with the
+# camelCase keys below (matchId, isVisible), and creates via this class
+# will still show up as empty results until those three `doc!` filters are
+# changed to "matchId" / "isVisible" on the Rust side.
+class SubFixtureStore:
+    def __init__(self, mongo_uri: str):
+        self._client = MongoClient(mongo_uri)
+        self._collection: Collection = self._client[config.MONGO_DB][
+            "sub_fixture_markets"
+        ]
+        self._ensure_indexes()
+
+    def _ensure_indexes(self):
+        """market_id is only unique per match_id (e.g. every match has its
+        own "<match_id>_first_goal"), so this is a compound index, not a
+        unique index on marketId alone."""
+        try:
+            self._collection.create_index(
+                [("matchId", 1), ("marketId", 1)], unique=True
+            )
+            self._collection.create_index("matchId")
+        except Exception as e:
+            logger.warning(f"sub_fixture_markets index issue: {e}")
+
+    def create_market(
+        self,
+        match_id: str,
+        market_type: str,  # "first_goal" | "first_card" | "first_corner"
+        options: List[str],  # e.g. ["home", "away"]
+        line: Optional[float] = None,
+        lock_at: Optional[datetime] = None,
+    ) -> str:
+        """
+        Create (or no-op if already present) a sub-fixture market.
+        Document keys match Rust's SubFixtureMarket struct exactly.
+
+        Unlike Game.id (String, hand-set to match_id), SubFixtureMarket.id
+        is Option<ObjectId> -- so _id is deliberately NOT set here; Mongo
+        auto-generates a real ObjectId on insert, same as insert_one()
+        would do on the Rust side. market_id (a plain string, separate
+        from _id) is the actual business key SubFixtureBet.market_id
+        references -- generated here since nothing else assigns one.
+
+        Uses $setOnInsert + upsert so calling this repeatedly (e.g. once
+        per poll cycle) never resets pledgeCounts/pledgeTotals/result on
+        an already-open market.
+        """
+        market_id = f"{match_id}_{market_type}"
+        now = datetime.now(timezone.utc)
+
+        doc = {
+            "matchId": match_id,
+            "marketId": market_id,
+            "marketType": market_type,
+            "options": options,
+            "line": line,
+            "status": "open",
+            "lockAt": lock_at,
+            "pledgeCounts": {opt: 0 for opt in options},
+            "pledgeTotals": {opt: 0 for opt in options},
+            "result": None,
+            "isVisible": True,
+            "createdAt": now,
+            "updatedAt": now,
+            "settledAt": None,
+        }
+
+        self._collection.update_one(
+            {"matchId": match_id, "marketId": market_id},
+            {"$setOnInsert": doc},
+            upsert=True,
+        )
+        return market_id
+
+    def create_markets_bulk(
+        self,
+        match_id: str,
+        market_specs: List[Dict[str, Any]],
+    ) -> List[str]:
+        """
+        Create several markets for one match in one call, e.g.:
+            [
+                {"market_type": "first_goal", "options": ["home", "away"]},
+                {"market_type": "first_card", "options": ["home", "away"]},
+            ]
+        Returns the list of market_ids created (or already existing).
+        """
+        return [
+            self.create_market(
+                match_id=match_id,
+                market_type=spec["market_type"],
+                options=spec["options"],
+                line=spec.get("line"),
+                lock_at=spec.get("lock_at"),
+            )
+            for spec in market_specs
+        ]
+
+    def get_market(self, match_id: str, market_id: str) -> Optional[Dict[str, Any]]:
+        """Get a single sub-fixture market."""
+        return self._collection.find_one({"matchId": match_id, "marketId": market_id})
+
+    def get_markets_for_match(self, match_id: str) -> List[Dict[str, Any]]:
+        """Get all visible sub-fixture markets for a match."""
+        return list(self._collection.find({"matchId": match_id, "isVisible": True}))
+
+    def set_result(self, match_id: str, market_id: str, result: Optional[str]) -> None:
+        """Record the settlement result on the market document itself
+        (separate from settling individual bets, which the Rust
+        /sub-fixture/settle endpoint already handles)."""
+        self._collection.update_one(
+            {"matchId": match_id, "marketId": market_id},
+            {
+                "$set": {
+                    "status": "settled",
+                    "result": result,
+                    "settledAt": datetime.now(timezone.utc),
+                    "updatedAt": datetime.now(timezone.utc),
+                }
+            },
+        )
+
+    def close(self) -> None:
+        """Close the MongoDB connection."""
+        self._client.close()
+
+
 def create_store(mongo_uri: str = None) -> FixtureStore:
     """Create a FixtureStore instance with optional URI."""
     import os
@@ -725,3 +877,16 @@ def create_store(mongo_uri: str = None) -> FixtureStore:
     if not mongo_uri:
         raise ValueError("MONGO_URI environment variable is required")
     return FixtureStore(mongo_uri)
+
+
+def create_sub_fixture_store(mongo_uri: str = None) -> SubFixtureStore:
+    """Create a SubFixtureStore instance with optional URI. Reuses the
+    same MONGO_URI env var as create_store() -- same cluster, same
+    database (config.MONGO_DB), different collection."""
+    import os
+
+    if mongo_uri is None:
+        mongo_uri = os.environ.get("MONGO_URI")
+    if not mongo_uri:
+        raise ValueError("MONGO_URI environment variable is required")
+    return SubFixtureStore(mongo_uri)
