@@ -110,4 +110,47 @@ pub async fn get_upcoming_games(State(state): State<AppState>) -> Result<Json<Ve
 
 Nothing else in games.rs needs to change — `get_games` was already correct,
 and the model (`game.rs`) matches the corrected Python output once the
-poller/mongo_store fixes are deployed and you rescrape.
+poller/mongo_store fixes are deployed and you rescrape.# Patch for sources/threesixtyfive.py
+
+Only one change needed in the whole file. `fetch_lineups()` currently
+hardcodes the World Cup match-id prefix:
+
+```python
+    result = {
+        "fixture_id": f"wc26_{game_id}",
+        "home": home_lineups or {},
+        "away": away_lineups or {},
+    }
+```
+
+Replace with a `match_id_prefix` parameter so callers (poller.py, scraper.py)
+pass in the same competition-keyed prefix used in scraper.py's `match_id`
+(e.g. `"nations_league"`, `"euro_qualifiers"`) instead of an implicit
+World Cup assumption:
+
+```python
+def fetch_lineups(
+    game_id: str,
+    away_id: int,
+    home_id: int,
+    competition_id: int,
+    match_id_prefix: str = "intl",
+) -> Optional[Dict[str, Any]]:
+    ...
+    result = {
+        "fixture_id": f"{match_id_prefix}_{game_id}",
+        "home": home_lineups or {},
+        "away": away_lineups or {},
+    }
+```
+
+Everything else in the file (fetch_games_by_competition, fetch_game_details,
+fetch_statistics, fetch_commentary, fetch_match_events, is_game_finished,
+classify_match_phase) is competition-agnostic already -- it takes
+competition_id / game_id as plain parameters and doesn't assume World Cup
+anywhere else. No other changes needed there.
+
+Wherever poller.py calls fetch_lineups (I don't have that file's contents,
+only scraper.py/config.py/main.py were pulled), pass
+`match_id_prefix=<the same key you used for that game's match_id>`, e.g.
+using scraper.py's `_ID_TO_KEY` mapping against the game's `competitionId`.
