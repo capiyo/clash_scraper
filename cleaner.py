@@ -14,145 +14,243 @@ if not MONGO_URI:
 client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
 
-fixtures_col = db["games"]
-channel_fixtures_col = db["channel_fixtures"]
+# ============================================================================
+# COLLECTIONS
+# ============================================================================
+
+posts_col = db["posts"]
+comments_col = db["comments"]
 
 print("=" * 60)
-print("MIGRATION: fixtures → channel_fixtures")
+print("MIGRATION: Add Firebase Image Fields + Video Fields + Reply Support")
 print("=" * 60)
 
-# Fields to REMOVE from fixtures
-FIELDS_TO_REMOVE_FROM_FIXTURES = [
-    "votes",
-    "voters",
-    "comments",
-    "commentary",
-    "commentaryCount",
-    "pledges",
-    "bets",
-    "likes",
-]
+# ============================================================================
+# FIELDS TO ADD TO POSTS
+# ============================================================================
 
-# Fields to ADD to channel_fixtures (with defaults)
-FIELDS_TO_ADD_TO_CHANNEL = {
-    "vote_counts": {"home": 0, "away": 0, "draw": 0},
-    "comment_count": 0,
-    "pledge_count": 0,
-    "bet_count": 0,
-    "likes_count": 0,
-    "last_message": "",
-    "last_message_at": None,
-    "last_sender": "",
-    "unread_counts": {},
+POST_FIELDS = {
+    # Video fields
+    "video_url": None,
+    "video_thumbnail_url": None,
+    "video_duration": None,  # seconds
+    "video_size": None,  # bytes
+    "firebase_public_id": None,  # Firebase storage path for video
+    # ✅ NEW: Firebase Image fields
+    "firebase_image_url": None,  # Firebase storage URL for image
+    "firebase_image_public_id": None,  # Firebase storage path for image
+    "post_type": "text",  # text, image, video, text_and_image, text_and_video
 }
 
-print("\n📊 Fetching all fixtures...")
-fixtures = fixtures_col.find({})
+# ============================================================================
+# FIELDS TO ADD TO COMMENTS
+# ============================================================================
 
-channel_updates = []
-fixture_updates = []
-updated_channels = 0
+COMMENT_REPLY_FIELDS = {
+    "parent_comment_id": None,
+}
 
-for fixture in fixtures:
-    fixture_id = fixture.get("match_id") or fixture.get("_id")
-    if not fixture_id:
+print("\n📊 Fetching all posts...")
+posts = posts_col.find({})
+
+post_updates = []
+updated_posts = 0
+
+for post in posts:
+    post_id = post.get("_id")
+    if not post_id:
         continue
 
-    # Find all channel_fixtures for this fixture
-    channel_fixtures = channel_fixtures_col.find({"fixture_id": fixture_id})
+    update_doc = {}
 
-    for cf in channel_fixtures:
-        update_doc = {}
+    # Add fields if they don't exist
+    for field, default_value in POST_FIELDS.items():
+        if field not in post or post.get(field) is None:
+            # Handle post_type based on existing data
+            if field == "post_type":
+                has_image = post.get("image_url") is not None
+                has_video = post.get("video_url") is not None
+                has_caption = (
+                    post.get("caption") is not None and post.get("caption") != ""
+                )
 
-        # Add fields if they don't exist
-        for field, default_value in FIELDS_TO_ADD_TO_CHANNEL.items():
-            if field not in cf or cf.get(field) is None:
-                if field == "vote_counts":
-                    # Special handling for vote_counts
-                    total_votes = fixture.get("votes", 0)
-                    if total_votes > 0:
-                        update_doc["vote_counts"] = {
-                            "home": total_votes,
-                            "away": 0,
-                            "draw": 0,
-                        }
-                    else:
-                        update_doc["vote_counts"] = {"home": 0, "away": 0, "draw": 0}
-                elif field == "comment_count":
-                    comments = fixture.get("comments", 0)
-                    commentary_count = fixture.get("commentaryCount", 0)
-                    update_doc["comment_count"] = comments + commentary_count
+                if has_video and has_caption:
+                    update_doc["post_type"] = "text_and_video"
+                elif has_video:
+                    update_doc["post_type"] = "video"
+                elif has_image and has_caption:
+                    update_doc["post_type"] = "text_and_image"
+                elif has_image:
+                    update_doc["post_type"] = "image"
+                elif has_caption:
+                    update_doc["post_type"] = "text"
                 else:
-                    # Use fixture value if available, else default
-                    fixture_value = fixture.get(field.replace("_count", "s"), None)
-                    if fixture_value is not None:
-                        update_doc[field] = fixture_value
-                    else:
-                        update_doc[field] = default_value
+                    update_doc["post_type"] = "text"
+            else:
+                update_doc[field] = default_value
 
-        if update_doc:
-            channel_updates.append(UpdateOne({"_id": cf["_id"]}, {"$set": update_doc}))
-            updated_channels += 1
-            print(f"  ✅ Updated channel_fixture for {fixture_id}")
+    if update_doc:
+        post_updates.append(UpdateOne({"_id": post_id}, {"$set": update_doc}))
+        updated_posts += 1
+        if updated_posts % 100 == 0:
+            print(f"  ✅ Processed {updated_posts} posts...")
 
-    # Build remove operation for this fixture
-    remove_doc = {}
-    for field in FIELDS_TO_REMOVE_FROM_FIXTURES:
-        if field in fixture:
-            remove_doc[field] = ""
+# ============================================================================
+# ADD PARENT_COMMENT_ID TO COMMENTS
+# ============================================================================
 
-    if remove_doc:
-        fixture_updates.append(
-            UpdateOne({"_id": fixture["_id"]}, {"$unset": remove_doc})
-        )
-        print(f"  🗑️  Removed fields from fixture {fixture_id}")
+print("\n📊 Fetching all comments...")
+comments = comments_col.find({})
 
-# Execute channel_fixtures updates
-if channel_updates:
-    print(f"\n📤 Updating {len(channel_updates)} channel_fixtures...")
-    result = channel_fixtures_col.bulk_write(channel_updates)
-    print(f"✅ Updated {result.modified_count} channel_fixtures")
+comment_updates = []
+updated_comments = 0
 
-# Execute fixture updates (REMOVE fields)
-if fixture_updates:
-    print(f"\n🗑️  Removing fields from {len(fixture_updates)} fixtures...")
-    result = fixtures_col.bulk_write(fixture_updates)
-    print(f"✅ Removed fields from {result.modified_count} fixtures")
+for comment in comments:
+    comment_id = comment.get("_id")
+    if not comment_id:
+        continue
 
-# ================================================================
+    update_doc = {}
+
+    # Add parent_comment_id if it doesn't exist
+    if "parent_comment_id" not in comment:
+        update_doc["parent_comment_id"] = None
+
+    if update_doc:
+        comment_updates.append(UpdateOne({"_id": comment_id}, {"$set": update_doc}))
+        updated_comments += 1
+        if updated_comments % 100 == 0:
+            print(f"  ✅ Processed {updated_comments} comments...")
+
+# ============================================================================
+# EXECUTE UPDATES
+# ============================================================================
+
+# Execute post updates
+if post_updates:
+    print(f"\n📤 Updating {len(post_updates)} posts...")
+    result = posts_col.bulk_write(post_updates)
+    print(f"✅ Updated {result.modified_count} posts")
+
+# Execute comment updates
+if comment_updates:
+    print(f"\n📤 Updating {len(comment_updates)} comments...")
+    result = comments_col.bulk_write(comment_updates)
+    print(f"✅ Updated {result.modified_count} comments")
+
+# ============================================================================
 # VERIFICATION
-# ================================================================
+# ============================================================================
 
 print("\n" + "=" * 60)
 print("VERIFICATION")
 print("=" * 60)
 
-# Check a fixture to verify fields are removed
-sample_fixture = fixtures_col.find_one({})
-if sample_fixture:
-    fixture_id = sample_fixture.get("match_id") or sample_fixture.get("_id")
-    print(f"\n📋 Fixture {fixture_id} after migration:")
-    print(f"   - Has 'votes'? {'votes' in sample_fixture}")
-    print(f"   - Has 'pledges'? {'pledges' in sample_fixture}")
-    print(f"   - Has 'bets'? {'bets' in sample_fixture}")
-    print(f"   - Has 'comments'? {'comments' in sample_fixture}")
+# Check a post to verify fields are added
+sample_post = posts_col.find_one({})
+if sample_post:
+    print(f"\n📋 Post after migration:")
+    print(f"   - video_url: {sample_post.get('video_url', 'NOT FOUND')}")
+    print(
+        f"   - video_thumbnail_url: {sample_post.get('video_thumbnail_url', 'NOT FOUND')}"
+    )
+    print(f"   - video_duration: {sample_post.get('video_duration', 'NOT FOUND')}")
+    print(f"   - video_size: {sample_post.get('video_size', 'NOT FOUND')}")
+    print(
+        f"   - firebase_public_id: {sample_post.get('firebase_public_id', 'NOT FOUND')}"
+    )
+    print(
+        f"   - ✅ firebase_image_url: {sample_post.get('firebase_image_url', 'NOT FOUND')}"
+    )
+    print(
+        f"   - ✅ firebase_image_public_id: {sample_post.get('firebase_image_public_id', 'NOT FOUND')}"
+    )
+    print(f"   - post_type: {sample_post.get('post_type', 'NOT FOUND')}")
 
-# Check a channel_fixture to verify fields are added
-sample_cf = channel_fixtures_col.find_one({})
-if sample_cf:
-    print(f"\n📋 Channel Fixture after migration:")
-    print(f"   - vote_counts: {sample_cf.get('vote_counts', 'NOT FOUND')}")
-    print(f"   - comment_count: {sample_cf.get('comment_count', 'NOT FOUND')}")
-    print(f"   - pledge_count: {sample_cf.get('pledge_count', 'NOT FOUND')}")
-    print(f"   - bet_count: {sample_cf.get('bet_count', 'NOT FOUND')}")
-    print(f"   - likes_count: {sample_cf.get('likes_count', 'NOT FOUND')}")
-    print(f"   - last_message: '{sample_cf.get('last_message', 'NOT FOUND')}'")
+# Check a comment to verify parent_comment_id is added
+sample_comment = comments_col.find_one({})
+if sample_comment:
+    print(f"\n📋 Comment after migration:")
+    print(
+        f"   - parent_comment_id: {sample_comment.get('parent_comment_id', 'NOT FOUND')}"
+    )
+
+# ============================================================================
+# SPECIFIC CHECK FOR YOUR POST
+# ============================================================================
+
+print("\n" + "=" * 60)
+print("SPECIFIC POST CHECK")
+print("=" * 60)
+
+# Check the specific post you mentioned
+your_post = posts_col.find_one({"_id": "69d0f5d0f3375cc3e6aaaa7a"})
+if your_post:
+    print(f"\n📋 Your post (ID: 69d0f5d0f3375cc3e6aaaa7a):")
+    print(f"   - image_url: {your_post.get('image_url', 'NOT FOUND')}")
+    print(
+        f"   - cloudinary_public_id: {your_post.get('cloudinary_public_id', 'NOT FOUND')}"
+    )
+    print(
+        f"   - ✅ firebase_image_url: {your_post.get('firebase_image_url', 'NOT FOUND')}"
+    )
+    print(
+        f"   - ✅ firebase_image_public_id: {your_post.get('firebase_image_public_id', 'NOT FOUND')}"
+    )
+    print(f"   - video_url: {your_post.get('video_url', 'NOT FOUND')}")
+    print(
+        f"   - firebase_public_id: {your_post.get('firebase_public_id', 'NOT FOUND')}"
+    )
+    print(f"   - post_type: {your_post.get('post_type', 'NOT FOUND')}")
+else:
+    print("\n⚠️ Post with ID 69d0f5d0f3375cc3e6aaaa7a not found")
+
+# ============================================================================
+# COUNT STATS
+# ============================================================================
+
+print("\n" + "=" * 60)
+print("STATISTICS")
+print("=" * 60)
+
+total_posts = posts_col.count_documents({})
+total_comments = comments_col.count_documents({})
+
+posts_with_video = posts_col.count_documents({"video_url": {"$ne": None}})
+posts_with_image = posts_col.count_documents({"image_url": {"$ne": None}})
+posts_with_firebase_image = posts_col.count_documents(
+    {"firebase_image_url": {"$ne": None}}
+)
+
+print(f"\n📊 Total Posts: {total_posts}")
+print(f"   - With Video: {posts_with_video}")
+print(f"   - With Image: {posts_with_image}")
+print(f"   - With Firebase Image: {posts_with_firebase_image}")
+
+print(f"\n📊 Total Comments: {total_comments}")
+comments_with_parent = comments_col.count_documents(
+    {"parent_comment_id": {"$ne": None}}
+)
+print(f"   - With parent_comment_id: {comments_with_parent}")
+
+# ============================================================================
+# SUMMARY
+# ============================================================================
 
 print("\n" + "=" * 60)
 print("SUMMARY")
 print("=" * 60)
-print(f"✅ Channel fixtures updated: {updated_channels}")
-print(f"🗑️  Fixtures cleaned: {len(fixture_updates)}")
-print("✅ Migration complete!")
+print(f"✅ Posts updated: {updated_posts}")
+print(f"✅ Comments updated: {updated_comments}")
+print("\n✅ Migration complete!")
+print("\n📝 New fields added:")
+print("   - firebase_image_url (String)")
+print("   - firebase_image_public_id (String)")
+print("   - video_url (String)")
+print("   - video_thumbnail_url (String)")
+print("   - video_duration (Number)")
+print("   - video_size (Number)")
+print("   - firebase_public_id (String)")
+print("   - parent_comment_id (String)")
 
 client.close()
